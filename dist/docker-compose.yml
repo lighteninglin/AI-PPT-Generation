@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  ppt-web:
+    image: ppt-web:latest
+    container_name: ppt-web
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    volumes:
+      - ./data/projects:/app/projects
+      - ./data/config:/root/.ppt-web
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

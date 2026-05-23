@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPT-Web — AI一键生成PPT</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--accent:#3b82f6;--accent-h:#2563eb;--text:#e2e8f0;--muted:#94a3b8;--success:#22c55e;--error:#ef4444}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.container{max-width:900px;margin:0 auto;padding:24px}
+header{text-align:center;padding:40px 0 30px}
+header h1{font-size:2rem;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header p{color:var(--muted);margin-top:8px}
+
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card h2{font-size:1.1rem;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card h2::before{content:'';width:4px;height:20px;background:var(--accent);border-radius:2px}
+
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.9rem;outline:none;transition:border-color .2s}
+.form-group input:focus,.form-group textarea:focus{border-color:var(--accent)}
+.form-group textarea{min-height:200px;resize:vertical;font-family:monospace;font-size:.85rem}
+.form-row{display:flex;gap:12px}
+.form-row .form-group{flex:1}
+
+.btn{padding:10px 24px;border:none;border-radius:8px;font-size:.95rem;cursor:pointer;transition:all .2s;font-weight:500}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-h)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-sm{padding:6px 14px;font-size:.85rem}
+.btn-success{background:var(--success);color:#fff}
+
+.status-bar{display:flex;align-items:center;gap:12px;margin-top:16px;padding:12px 16px;background:var(--bg);border-radius:8px;font-size:.9rem}
+.status-bar .stage{color:var(--accent);font-weight:600;min-width:100px}
+.status-bar .msg{flex:1;color:var(--muted)}
+.progress-wrap{background:var(--bg);border-radius:4px;height:8px;margin-top:8px;overflow:hidden}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),#a78bfa);border-radius:4px;transition:width .3s}
+
+.result{margin-top:16px;display:none}
+.result.show{display:block}
+.result-actions{display:flex;gap:10px;margin-top:12px}
+
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+
+.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75rem;background:var(--accent);color:#fff}
+.tag-ok{background:var(--success)}
+.tag-err{background:var(--error)}
+
+footer{text-align:center;padding:30px;color:var(--muted);font-size:.8rem}
+
+/* 配置区折叠 */
+.config-toggle{cursor:pointer;user-select:none}
+.config-body{overflow:hidden;transition:max-height .3s}
+.config-body.collapsed{max-height:0 !important}
+
+/* Tab 按钮 */
+.tab-btn{flex:1;padding:8px 0;border:none;background:var(--bg);color:var(--muted);font-size:.85rem;cursor:pointer;transition:all .2s}
+.tab-btn.active{background:var(--accent);color:#fff}
+.tab-btn:hover:not(.active){background:var(--card);color:var(--text)}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🎨 PPT-Web</h1>
+    <p>AI 驱动的 PPT 一键生成 — 只需配置 OpenAI 兼容 API</p>
+  </header>
+
+  <!-- 配置卡片 -->
+  <div class="card">
+    <h2 class="config-toggle" onclick="toggleConfig()">⚙️ 服务配置 <span id="cfgArrow" style="font-size:.8rem">▼</span></h2>
+    <div id="cfgBody" class="config-body" style="max-height:300px">
+      <div style="display:flex;align-items:center;gap:16px;padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:12px">
+        <span id="cfgStatus" style="font-size:.9rem"></span>
+      </div>
+      <div class="grid-2" style="font-size:.85rem;color:var(--muted)">
+        <div><b>模型:</b> <span id="infoModel">-</span></div>
+        <div><b>API地址:</b> <span id="infoUrl">-</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 生成卡片 -->
+  <div class="card">
+    <h2>📝 生成 PPT</h2>
+    <div class="form-group">
+      <label>PPT 主题 / 标题</label>
+      <input type="text" id="topic" placeholder="例：2025年Q1市场分析报告">
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>画布格式</label>
+        <select id="format">
+          <option value="ppt169">宽屏 16:9</option>
+          <option value="ppt43">标准 4:3</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.88rem;padding:8px 0">
+          <input type="checkbox" id="enableThinking" style="width:auto">
+          <span>🧠 思考模式</span>
+        </label>
+        <div style="font-size:.7rem;color:var(--muted);margin-top:-4px">开启后效果更好，但速度较慢</div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>源内容</label>
+      <div style="display:flex;gap:0;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+        <button type="button" id="tabFile" class="tab-btn" onclick="switchTab('file')">📎 上传文档</button>
+        <button type="button" id="tabText" class="tab-btn active" onclick="switchTab('text')">📝 粘贴文本</button>
+      </div>
+      <!-- 上传区 -->
+      <div id="panelFile" style="display:none">
+        <div id="dropZone" style="border:2px dashed var(--border);border-radius:8px;padding:28px 20px;text-align:center;cursor:pointer;transition:border-color .2s"
+             onclick="document.getElementById('fileInput').click()">
+          <div style="font-size:2rem">📎</div>
+          <div style="font-size:.9rem;color:var(--muted);margin-top:6px">点击或拖拽文件到此处</div>
+          <div style="font-size:.75rem;color:var(--muted);margin-top:4px">支持 md / txt / docx / pdf</div>
+          <div id="uploadStatus" style="font-size:.85rem;margin-top:8px"></div>
+          <input type="file" id="fileInput" accept=".md,.txt,.docx,.pdf" style="display:none" onchange="handleUpload(this)">
+        </div>
+      </div>
+      <!-- 文本区 -->
+      <div id="panelText">
+        <textarea id="sourceText" placeholder="在此粘贴文档内容...&#10;&#10;支持 Markdown 格式，也可以直接粘贴纯文本。&#10;AI 会根据内容自动规划PPT结构和页面。"></textarea>
+      </div>
+      <!-- 隐藏字段存实际内容 -->
+      <input type="hidden" id="sourceContent" value="">
+    </div>
+    <button class="btn btn-primary" id="genBtn" onclick="startGenerate()">🚀 开始生成</button>
+
+    <div id="statusArea" style="display:none">
+      <div class="status-bar">
+        <span class="stage" id="stageText">准备中</span>
+        <span class="msg" id="msgText">...</span>
+        <span id="pctText">0%</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-bar" id="progressBar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <div class="result" id="resultArea">
+      <div class="grid-2">
+        <div style="padding:16px;background:var(--bg);border-radius:8px;text-align:center">
+          <div style="font-size:2rem">📊</div>
+          <div style="margin-top:8px" id="resultInfo">生成完成</div>
+        </div>
+        <div class="result-actions" style="flex-direction:column;justify-content:center">
+          <button class="btn btn-success" onclick="downloadPptx()">⬇️ 下载 PPTX</button>
+          <button class="btn btn-sm" style="background:var(--border);color:var(--text);margin-top:8px" onclick="previewSvg()">👁 预览页面</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>PPT-Web · 基于 <a href="https://github.com/hugohe3/ppt-master" style="color:var(--accent)">ppt-master</a> 构建</footer>
+</div>
+
+<script>
+const API = '';
+let currentTaskId = null;
+
+// ── 配置 ──
+async function loadConfig() {
+  try {
+    const r = await fetch(API + '/api/config');
+    const d = await r.json();
+    document.getElementById('infoModel').textContent = d.model_name || '-';
+    document.getElementById('infoUrl').textContent = d.base_url || '-';
+    document.getElementById('cfgStatus').innerHTML = d.is_configured
+      ? '<span class="tag tag-ok">✅ 已连接</span>'
+      : '<span class="tag tag-err">⚠️ 未配置</span>';
+    // 思考模式从localStorage读取用户偏好
+    const cb = document.getElementById('enableThinking');
+    cb.checked = localStorage.getItem('ppt_thinking') === '1';
+  } catch(e) { console.warn('加载配置失败', e); }
+}
+
+// 思考模式变更：存localStorage
+document.getElementById('enableThinking').addEventListener('change', function() {
+  localStorage.setItem('ppt_thinking', this.checked ? '1' : '0');
+});
+
+function toggleConfig() {
+  const body = document.getElementById('cfgBody');
+  const arrow = document.getElementById('cfgArrow');
+  body.classList.toggle('collapsed');
+  arrow.textContent = body.classList.contains('collapsed') ? '▶' : '▼';
+}
+
+// ── 输入方式切换 ──
+let currentTab = 'text';
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabFile').classList.toggle('active', tab === 'file');
+  document.getElementById('tabText').classList.toggle('active', tab === 'text');
+  document.getElementById('panelFile').style.display = tab === 'file' ? '' : 'none';
+  document.getElementById('panelText').style.display = tab === 'text' ? '' : 'none';
+}
+
+// ── 文件上传 ──
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--accent)'; });
+dropZone.addEventListener('dragleave', () => { dropZone.style.borderColor = 'var(--border)'; });
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.style.borderColor = 'var(--border)';
+  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+});
+
+async function handleUpload(input) {
+  if (input.files.length) await uploadFile(input.files[0]);
+  input.value = '';
+}
+
+async function uploadFile(file) {
+  const status = document.getElementById('uploadStatus');
+  status.style.color = 'var(--accent)';
+  status.textContent = '⏳ 正在解析 ' + file.name + ' ...';
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch(API + '/api/upload', { method: 'POST', body: fd });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '上传失败'); }
+    const d = await r.json();
+    document.getElementById('sourceContent').value = d.text;
+    // 自动填充topic（如果为空）
+    if (!document.getElementById('topic').value.trim()) {
+      const name = file.name.replace(/\.[^.]+$/, '');
+      document.getElementById('topic').value = name;
+    }
+    status.style.color = 'var(--success)';
+    status.textContent = '✅ ' + file.name + ' (' + d.char_count + ' 字)';
+  } catch(e) {
+    status.style.color = 'var(--error)';
+    status.textContent = '❌ ' + e.message;
+  }
+}
+
+// ── 生成 ──
+async function startGenerate() {
+  const topic = document.getElementById('topic').value.trim();
+  const fmt = document.getElementById('format').value;
+  if (!topic) { alert('请填写PPT主题'); return; }
+
+  let sourceText;
+  if (currentTab === 'file') {
+    sourceText = document.getElementById('sourceContent').value;
+    if (!sourceText) { alert('请先上传文档文件'); return; }
+  } else {
+    sourceText = document.getElementById('sourceText').value.trim();
+    if (!sourceText) { alert('请输入或粘贴源内容'); return; }
+  }
+
+  document.getElementById('genBtn').disabled = true;
+  document.getElementById('statusArea').style.display = 'block';
+  document.getElementById('resultArea').classList.remove('show');
+  updateProgress('init', '提交任务...', 0);
+
+  try {
+    const r = await fetch(API + '/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source_text: sourceText, topic, format: fmt, enable_thinking: document.getElementById('enableThinking').checked})
+    });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '请求失败'); }
+    const d = await r.json();
+    currentTaskId = d.task_id;
+    pollTask();
+  } catch(e) {
+    updateProgress('error', e.message, 0);
+    document.getElementById('genBtn').disabled = false;
+  }
+}
+
+async function pollTask() {
+  if (!currentTaskId) return;
+  try {
+    const r = await fetch(API + '/api/tasks/' + currentTaskId);
+    const d = await r.json();
+    updateProgress(d.stage || d.status, d.message, d.progress || 0);
+    if (d.status === 'running') {
+      setTimeout(pollTask, 1500);
+    } else if (d.status === 'done') {
+      document.getElementById('genBtn').disabled = false;
+      document.getElementById('resultArea').classList.add('show');
+    } else {
+      document.getElementById('genBtn').disabled = false;
+    }
+  } catch(e) {
+    setTimeout(pollTask, 3000);
+  }
+}
+
+function updateProgress(stage, msg, pct) {
+  document.getElementById('stageText').textContent = stage;
+  document.getElementById('msgText').textContent = msg;
+  document.getElementById('pctText').textContent = pct + '%';
+  document.getElementById('progressBar').style.width = pct + '%';
+}
+
+function downloadPptx() {
+  if (currentTaskId) window.open(API + '/api/download/' + currentTaskId, '_blank');
+}
+
+function previewSvg() {
+  if (currentTaskId) window.open(API + '/api/preview/' + currentTaskId, '_blank');
+}
+
+// ── 初始化 ──
+loadConfig();
+</script>
+</body>
+</html>

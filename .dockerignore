@@ -1,0 +1,14 @@
+node_modules
+.git
+*.pyc
+__pycache__
+.env
+*.egg-info
+projects/*.pptx
+projects/*/exports
+projects/*/svg_output
+projects/*/svg_final
+projects/*/sources
+projects/*/images
+projects/*/notes
+projects/*/templates
