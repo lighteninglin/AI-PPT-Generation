@@ -63,11 +63,20 @@ class ConfigManager:
         env_url = os.environ.get("LLM_BASE_URL", "").strip()
         env_model = os.environ.get("LLM_MODEL", "").strip()
 
-        return LLMConfig(
+        cfg = LLMConfig(
             api_key=env_key or file_cfg.get("api_key", ""),
             base_url=env_url or file_cfg.get("base_url", "https://api.openai.com/v1"),
             model_name=env_model or file_cfg.get("model_name", "gpt-4o"),
         )
+
+        # 环境变量存在时，同步更新 config.json（避免显示旧值）
+        if env_key or env_url or env_model:
+            try:
+                ConfigManager.save(cfg)
+            except Exception:
+                pass
+
+        return cfg
 
     @staticmethod
     def save(config: LLMConfig) -> None:

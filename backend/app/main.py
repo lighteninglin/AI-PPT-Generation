@@ -1,19 +1,23 @@
 """
-PPT-Web FastAPI 应用 — 极简，只做配置/生成/下载
+PPT-Web FastAPI 应用 — 完整7步流水线
+Step 4 (Eight Confirmations) 需要 ⛔BLOCKING 用户交互确认
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+import subprocess
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import ConfigManager, LLMConfig
@@ -22,43 +26,53 @@ from .ppt_engine import PPTEngine, PROJECTS_DIR
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PPT-Web", version="1.0.0")
+app = FastAPI(title="PPT-Web", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── 前端静态文件 ──
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
-# ── 任务管理(单用户足够) ──
+# ── 任务管理 ──
 tasks: dict[str, dict] = {}
 ws_connections: dict[str, list[WebSocket]] = {}
 
 
 # ── 数据模型 ──
 
-class ConfigPayload(BaseModel):
+class PreviewPayload(BaseModel):
+    source_text: str
+    topic: str
+    source_type: str = "text"
+    format: str = "ppt169"
     enable_thinking: bool = False
+
+
+class ConfirmPayload(BaseModel):
+    task_id: str
+    confirmations: dict  # 用户确认/修改后的 Eight Confirmations
+    spec_lock: Optional[str] = None  # 如果用户没改, 直接用原始 spec_lock
+    enable_thinking: bool = False
+
 
 class GeneratePayload(BaseModel):
     source_text: str
     topic: str
-    source_type: str = "text"   # text / markdown
-    format: str = "ppt169"      # ppt169 / ppt43
-    enable_thinking: bool = False  # 每次请求独立传入
+    source_type: str = "text"
+    format: str = "ppt169"
+    enable_thinking: bool = False
 
 
-# ── API 路由 ──
+# ══════════════════════════════════════════════════════════
+#  API 路由
+# ══════════════════════════════════════════════════════════
 
 @app.get("/api/config")
 def get_config():
     return ConfigManager.get_masked()
 
 
-@app.post("/api/config")
-def save_config(payload: ConfigPayload):
-    cfg = ConfigManager.load()
-    cfg.enable_thinking = payload.enable_thinking
-    ConfigManager.save(cfg)
-    return {"ok": True, "message": "配置已保存"}
+@app.get("/api/health")
+def health():
+    return {"ok": True}
 
 
 @app.post("/api/upload")
@@ -71,12 +85,10 @@ async def upload_file(file: UploadFile = File(...)):
     if ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(400, f"不支持的文件格式: {ext}，支持: {', '.join(SUPPORTED_EXTENSIONS)}")
 
-    # 限制文件大小 50MB
     contents = await file.read()
     if len(contents) > 50 * 1024 * 1024:
         raise HTTPException(400, "文件不能超过 50MB")
 
-    # 写临时文件
     import tempfile
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
@@ -94,15 +106,14 @@ async def upload_file(file: UploadFile = File(...)):
     if not text.strip():
         raise HTTPException(400, "未能从文件中提取到文本内容")
 
-    return {
-        "filename": filename,
-        "text": text,
-        "char_count": len(text),
-    }
+    return {"filename": filename, "text": text, "char_count": len(text)}
 
 
-@app.post("/api/generate")
-async def start_generate(payload: GeneratePayload):
+# ── Step 4 交互式流程 ──
+
+@app.post("/api/generate/preview")
+async def start_preview(payload: PreviewPayload):
+    """Steps 1-4: 生成设计方案 + Eight Confirmations (供用户确认)"""
     cfg = ConfigManager.load()
     if not cfg.is_configured():
         raise HTTPException(400, "请先配置 LLM API Key")
@@ -110,17 +121,81 @@ async def start_generate(payload: GeneratePayload):
     task_id = uuid.uuid4().hex[:12]
     tasks[task_id] = {
         "id": task_id,
-        "status": "running",
+        "status": "previewing",
         "progress": 0,
         "stage": "init",
-        "message": "任务已创建",
+        "message": "正在生成设计方案...",
         "result_path": None,
         "topic": payload.topic,
+        "preview_data": None,  # 待填充
     }
 
-    # 后台执行
-    asyncio.create_task(_run_task(task_id, cfg, payload))
+    asyncio.create_task(_run_preview(task_id, cfg, payload))
     return {"task_id": task_id}
+
+
+class ReplanPayload(BaseModel):
+    task_id: str
+    target_pages: int
+    enable_thinking: bool = False
+
+
+@app.post("/api/generate/replan")
+async def replan_pages(payload: ReplanPayload):
+    """用户调整页数后，让LLM重新规划 page_plan"""
+    task = tasks.get(payload.task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    pd = task.get("preview_data")
+    if not pd:
+        raise HTTPException(400, "无预览数据")
+
+    cfg = ConfigManager.load()
+    engine = PPTEngine(cfg)
+    loop = asyncio.get_event_loop()
+
+    new_pages = await loop.run_in_executor(
+        None,
+        lambda: engine.replan_page_plan(
+            source_text=pd.get("source_text", ""),
+            topic=pd.get("topic", task.get("topic", "")),
+            spec_lock=pd.get("spec_lock", ""),
+            target_pages=payload.target_pages,
+            enable_thinking=payload.enable_thinking,
+        )
+    )
+
+    if new_pages:
+        pd["page_plan"] = new_pages
+        # 同步更新 eight_confirmations 的 page_count
+        cf = pd.get("eight_confirmations", {})
+        pc = cf.get("page_count", {})
+        pc["recommended"] = payload.target_pages
+        if pc.get("min", 0) > payload.target_pages:
+            pc["min"] = payload.target_pages
+        if pc.get("max", 0) < payload.target_pages:
+            pc["max"] = payload.target_pages
+        cf["page_count"] = pc
+        pd["eight_confirmations"] = cf
+        task["preview_data"] = pd
+
+    return {"page_plan": new_pages}
+
+
+@app.post("/api/generate/confirm")
+async def confirm_and_execute(payload: ConfirmPayload):
+    """用户确认 Eight Confirmations → Steps 5-7: 生成SVG + 导出PPTX"""
+    task = tasks.get(payload.task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    if task["status"] != "awaiting_confirm":
+        raise HTTPException(400, f"任务状态不对: {task['status']}，需要先完成设计预览")
+
+    task["status"] = "executing"
+    task["message"] = "正在生成PPT..."
+
+    asyncio.create_task(_run_execute(payload.task_id, payload))
+    return {"task_id": payload.task_id}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -139,31 +214,41 @@ def download_pptx(task_id: str):
     path = Path(task["result_path"])
     if not path.exists():
         raise HTTPException(404, "文件已丢失")
-    return FileResponse(str(path), filename=path.name, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    return FileResponse(
+        str(path), filename=path.name,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
 
 
 @app.get("/api/preview/{task_id}")
 def preview_svg(task_id: str):
-    """返回SVG预览页面(HTML)"""
+    """返回SVG预览编辑页面"""
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
-    project_dir = Path(task["result_path"]).parent.parent if task.get("result_path") else None
-    if not project_dir or not project_dir.exists():
-        raise HTTPException(404, "项目目录不存在")
-
-    svg_dir = project_dir / "svg_output"
-    if not svg_dir.exists():
-        raise HTTPException(404, "SVG 尚未生成")
-
-    svgs = sorted(svg_dir.glob("*.svg"))
-    html = '<html><head><meta charset="utf-8"><title>PPT预览</title><style>'
-    html += 'body{background:#1a1a2e;display:flex;flex-wrap:wrap;gap:12px;padding:20px;justify-content:center;}'
-    html += 'img{max-width:400px;height:auto;aspect-ratio:16/9;object-fit:contain;border:2px solid #333;border-radius:8px;background:#fff;}</style></head><body>'
-    for svg in svgs:
-        html += f'<img src="/api/svg/{task_id}/{svg.name}" />'
-    html += '</body></html>'
+    html_path = FRONTEND_DIST / "svg-editor.html"
+    if not html_path.exists():
+        raise HTTPException(500, "SVG编辑器未部署")
+    html = html_path.read_text(encoding="utf-8")
+    # 注入下载链接
+    html = html.replace('id="download-link" href="#"', f'id="download-link" href="/api/download/{task_id}"')
     return HTMLResponse(html)
+
+
+# SVG编辑器静态文件
+@app.get("/svg-editor-style.css")
+def serve_editor_css():
+    css = FRONTEND_DIST / "svg-editor-style.css"
+    if css.exists():
+        return FileResponse(str(css), media_type="text/css")
+    raise HTTPException(404)
+
+@app.get("/svg-editor-app.js")
+def serve_editor_js():
+    js = FRONTEND_DIST / "svg-editor-app.js"
+    if js.exists():
+        return FileResponse(str(js), media_type="application/javascript")
+    raise HTTPException(404)
 
 
 @app.get("/api/svg/{task_id}/{svg_name}")
@@ -173,17 +258,41 @@ def serve_svg(task_id: str, svg_name: str):
         raise HTTPException(404)
     project_dir = Path(task["result_path"]).parent.parent if task.get("result_path") else None
     if not project_dir:
-        raise HTTPException(404)
+        if task.get("preview_data") and task["preview_data"].get("project_path"):
+            project_dir = Path(task["preview_data"]["project_path"])
+        if not project_dir:
+            raise HTTPException(404)
     svg_path = project_dir / "svg_output" / svg_name
     if not svg_path.exists():
         raise HTTPException(404)
     return FileResponse(str(svg_path), media_type="image/svg+xml")
 
 
-@app.get("/api/health")
-def health():
-    return {"ok": True}
+# ── 兼容旧的一步到位 API ──
 
+@app.post("/api/generate")
+async def start_generate(payload: GeneratePayload):
+    """一步到位(跳过用户确认, 向后兼容)"""
+    cfg = ConfigManager.load()
+    if not cfg.is_configured():
+        raise HTTPException(400, "请先配置 LLM API Key")
+
+    task_id = uuid.uuid4().hex[:12]
+    tasks[task_id] = {
+        "id": task_id,
+        "status": "running",
+        "progress": 0,
+        "stage": "init",
+        "message": "任务已创建",
+        "result_path": None,
+        "topic": payload.topic,
+    }
+
+    asyncio.create_task(_run_generate(task_id, cfg, payload))
+    return {"task_id": task_id}
+
+
+# ── WebSocket 进度 ──
 
 @app.websocket("/ws/tasks/{task_id}")
 async def ws_task_progress(ws: WebSocket, task_id: str):
@@ -193,44 +302,441 @@ async def ws_task_progress(ws: WebSocket, task_id: str):
     ws_connections[task_id].append(ws)
     try:
         while True:
-            await ws.receive_text()  # 保持连接
+            await ws.receive_text()
     except WebSocketDisconnect:
         ws_connections[task_id].remove(ws)
 
 
-# ── 前端 catch-all ──
+# ── SVG 预览/编辑 API ──
+
+def _get_project_dir(task_id: str) -> Path:
+    """从任务字典获取项目目录，失败抛 HTTPException"""
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    result_path = task.get("result_path")
+    if result_path:
+        # result_path 指向 exports/xxx.pptx，项目目录是其祖父级
+        project_dir = Path(result_path).parent.parent
+        if project_dir.exists():
+            return project_dir
+    # fallback: 从 preview_data 获取
+    preview_data = task.get("preview_data") or {}
+    project_path = preview_data.get("project_path")
+    if project_path and Path(project_path).exists():
+        return Path(project_path)
+    raise HTTPException(404, "项目目录不存在")
+
+
+def _safe_svg_name(name: str) -> str:
+    """检查SVG文件名安全性，防止路径遍历"""
+    if not name or ".." in name or "/" in name or "\\" in name:
+        raise HTTPException(400, "非法文件名")
+    if not name.lower().endswith(".svg"):
+        raise HTTPException(400, "仅支持 .svg 文件")
+    return name
+
+
+def _svg_dir_for(project_dir: Path) -> Path:
+    """返回可用SVG目录 (svg_final 优先, fallback svg_output)"""
+    svg_final = project_dir / "svg_final"
+    if svg_final.exists() and any(svg_final.glob("*.svg")):
+        return svg_final
+    svg_output = project_dir / "svg_output"
+    if svg_output.exists():
+        return svg_output
+    raise HTTPException(404, "SVG 尚未生成")
+
+
+@app.get("/api/preview/{task_id}/slides")
+def list_slides(task_id: str):
+    """返回项目 SVG 文件列表"""
+    project_dir = _get_project_dir(task_id)
+    svg_dir = _svg_dir_for(project_dir)
+    # 自然排序: slide_02 < slide_10 (不是字典序 slide_10 < slide_2)
+    import re as _re
+    def _natural_key(s):
+        return [int(c) if c.isdigit() else c.lower() for c in _re.split(r'(\d+)', s)]
+    svgs = sorted((p.name for p in svg_dir.glob("*.svg")), key=_natural_key)
+    # 返回对象数组, 兼容 svg_editor app.js 期望的格式
+    slides = []
+    ann_store = _annotation_store.get(task_id, {})
+    for name in svgs:
+        file_anns = ann_store.get(name, {})
+        slides.append({"name": name, "annotation_count": len(file_anns)})
+    return {"slides": slides, "dir": svg_dir.name}
+
+
+@app.get("/api/preview/{task_id}/slide/{name}")
+def get_slide(task_id: str, name: str):
+    """返回单个 SVG 文件内容 (含标注)"""
+    from .svg_annotations import assign_temp_ids, parse_annotations
+
+    safe_name = _safe_svg_name(name)
+    project_dir = _get_project_dir(task_id)
+    svg_dir = _svg_dir_for(project_dir)
+    svg_path = svg_dir / safe_name
+    if not svg_path.exists():
+        raise HTTPException(404, f"SVG 文件不存在: {safe_name}")
+
+    # 解析SVG并分配临时ID
+    root = None
+    try:
+        tree = ET.parse(str(svg_path))
+        root = tree.getroot()
+        assign_temp_ids(root)
+        disk_annotations = parse_annotations(root)
+        # ET.tostring 会把默认命名空间变成 ns0: 前缀, 浏览器不认, 必须清除
+        content = ET.tostring(root, encoding="unicode", xml_declaration=False)
+        content = re.sub(r'\bns0:', '', content)
+        content = re.sub(r'\s+xmlns:ns0="[^"]*"', '', content)
+        # 确保 xmlns 在根元素上
+        if 'xmlns="http://www.w3.org/2000/svg"' not in content:
+            content = content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    except ET.ParseError:
+        content = svg_path.read_text(encoding="utf-8")
+        disk_annotations = []
+
+    if root is None:
+        return {"name": safe_name, "content": content, "annotations": []}
+
+    # 合并内存中的标注
+    mem_store = _annotation_store.get(task_id, {}).get(name, {})
+    merged = {}
+    for ann in disk_annotations:
+        merged[ann["element_id"]] = ann["annotation"]
+    merged.update(mem_store)
+
+    annotations_list = []
+    for elem in root.iter():
+        eid = elem.get("id")
+        if eid and eid in merged:
+            tag = elem.tag.split("}", 1)[1] if "}" in elem.tag else elem.tag
+            annotations_list.append({
+                "element_id": eid,
+                "tag": tag,
+                "annotation": merged[eid],
+            })
+
+    return {"name": safe_name, "content": content, "annotations": annotations_list}
+
+
+# ── SVG Editor 标注路由 (复用 ppt-master annotations.py) ──
+
+# 每个task一个标注内存存储: {task_id: {filename: {element_id: annotation}}}
+_annotation_store: dict[str, dict[str, dict[str, str]]] = {}
+
+
+@app.post("/api/preview/{task_id}/slide/{name}/annotate")
+def annotate_element(task_id: str, name: str, payload: dict):
+    """添加/更新标注"""
+    _safe_svg_name(name)
+    element_id = payload.get("element_id", "")
+    annotation = payload.get("annotation", "")
+    if not element_id or not annotation:
+        raise HTTPException(400, "Missing element_id or annotation")
+
+    store = _annotation_store.setdefault(task_id, {})
+    file_store = store.setdefault(name, {})
+    file_store[element_id] = annotation
+    return {"status": "ok", "annotations_count": len(file_store)}
+
+
+@app.delete("/api/preview/{task_id}/slide/{name}/annotate/{element_id}")
+def delete_annotation(task_id: str, name: str, element_id: str):
+    """删除标注"""
+    _safe_svg_name(name)
+    store = _annotation_store.get(task_id, {})
+    file_store = store.setdefault(name, {})
+    file_store.pop(element_id, None)
+    return {"status": "ok", "annotations_count": len(file_store)}
+
+
+@app.post("/api/preview/{task_id}/save-all")
+def save_all_annotations(task_id: str):
+    """将所有标注写入SVG文件 (复用ppt-master annotations模块)"""
+    from .svg_annotations import assign_temp_ids, parse_annotations, set_annotation
+
+    store = _annotation_store.get(task_id, {})
+    project_dir = _get_project_dir(task_id)
+    svg_dir = _svg_dir_for(project_dir)
+    modified = []
+
+    for filename, anns in store.items():
+        safe_name = _safe_svg_name(filename)
+        svg_file = svg_dir / safe_name
+        if not svg_file.exists():
+            continue
+        try:
+            tree = ET.parse(str(svg_file))
+            root = tree.getroot()
+        except ET.ParseError:
+            continue
+
+        assign_temp_ids(root)
+        # 清除旧标注
+        for elem in root.iter():
+            elem.attrib.pop("data-edit-target", None)
+            elem.attrib.pop("data-edit-annotation", None)
+
+        # 写入新标注
+        for element_id, annotation_text in anns.items():
+            set_annotation(root, element_id, annotation_text)
+
+        # 清理未标注元素的临时id
+        annotated_ids = set(anns.keys())
+        for elem in root.iter():
+            eid = elem.get("id", "")
+            if eid.startswith("_edit_") and eid not in annotated_ids:
+                elem.attrib.pop("id", None)
+
+        tree.write(str(svg_file), encoding="UTF-8", xml_declaration=True)
+        modified.append(filename)
+
+    # 清空已保存的标注
+    _annotation_store.pop(task_id, None)
+    return {"status": "ok", "files_modified": modified}
+
+
+@app.get("/api/preview/{task_id}/config")
+def editor_config(task_id: str):
+    """编辑器配置"""
+    return {"live": False}
+
+
+@app.post("/api/preview/{task_id}/shutdown")
+def editor_shutdown(task_id: str):
+    """关闭编辑器 (web版不需要真正关闭, 直接返回ok)"""
+    return {"status": "ok"}
+
+
+class SVGEditPayload(BaseModel):
+    name: str
+    content: str
+
+
+@app.post("/api/preview/{task_id}/save")
+async def save_slide(task_id: str, payload: SVGEditPayload):
+    """保存用户修改后的 SVG，并重新导出 PPTX"""
+    safe_name = _safe_svg_name(payload.name)
+    project_dir = _get_project_dir(task_id)
+
+    # 确保 svg_final 目录存在
+    svg_final = project_dir / "svg_final"
+    svg_final.mkdir(parents=True, exist_ok=True)
+
+    target = svg_final / safe_name
+    target.write_text(payload.content, encoding="utf-8")
+    logger.info("SVG 已保存: %s", target)
+
+    # 重新导出 PPTX
+    from .ppt_engine import SCRIPTS_DIR
+    cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
+    await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
+
+    # 更新任务的 result_path 指向最新 PPTX
+    exports_dir = project_dir / "exports"
+    pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if pptx_files:
+        task = tasks.get(task_id, {})
+        task["result_path"] = str(pptx_files[0])
+
+    return {"ok": True, "saved": safe_name}
+
+
+@app.post("/api/preview/{task_id}/rebuild")
+async def rebuild_pptx(task_id: str):
+    """重新执行 finalize_svg + svg_to_pptx 导出 PPTX"""
+    project_dir = _get_project_dir(task_id)
+
+    from .ppt_engine import SCRIPTS_DIR
+
+    # Step 1: finalize_svg
+    finalize_cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "finalize_svg.py"), str(project_dir)]
+    result = await asyncio.to_thread(
+        subprocess.run, finalize_cmd, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        logger.error("finalize_svg 失败: %s", result.stderr)
+        raise HTTPException(500, f"finalize_svg 失败: {result.stderr[:500]}")
+
+    # Step 2: svg_to_pptx
+    export_cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
+    result = await asyncio.to_thread(
+        subprocess.run, export_cmd, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        logger.error("svg_to_pptx 失败: %s", result.stderr)
+        raise HTTPException(500, f"svg_to_pptx 失败: {result.stderr[:500]}")
+
+    # 更新任务 result_path
+    exports_dir = project_dir / "exports"
+    pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if pptx_files:
+        task = tasks.get(task_id, {})
+        task["result_path"] = str(pptx_files[0])
+
+    return {"ok": True, "message": "PPTX 重新导出完成"}
+
+
+# ── 前端 ──
 
 @app.get("/")
 async def serve_index():
     idx = FRONTEND_DIST / "index.html"
     if idx.exists():
         return HTMLResponse(idx.read_text())
-    return HTMLResponse(_dev_placeholder())
+    return HTMLResponse("<h1>PPT-Web</h1><p>前端未构建</p>")
 
 
-# ── 内部函数 ──
+# ══════════════════════════════════════════════════════════
+#  内部函数
+# ══════════════════════════════════════════════════════════
 
-async def _run_task(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
-    """后台运行生成任务"""
+def _notify_ws(task_id: str, data: dict, loop=None):
+    """推送 WebSocket (线程安全)"""
+    conns = ws_connections.get(task_id, [])
+    if not conns:
+        return
+    async def _send():
+        for ws in list(conns):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                pass
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+    else:
+        # 兜底：直接创建任务
+        try:
+            loop.create_task(_send())
+        except RuntimeError:
+            pass
+
+
+async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
+    """Steps 1-4: 生成设计方案"""
     task = tasks[task_id]
     try:
         engine = PPTEngine(cfg)
+
+        loop = asyncio.get_event_loop()
 
         def on_progress(stage, msg, pct):
             task["stage"] = stage
             task["message"] = msg
             task["progress"] = pct
-            # 推送 WebSocket
-            for ws in ws_connections.get(task_id, []):
-                try:
-                    asyncio.get_event_loop().create_task(
-                        ws.send_json({"stage": stage, "message": msg, "progress": pct})
-                    )
-                except Exception:
-                    pass
+            _notify_ws(task_id, {"stage": stage, "message": msg, "progress": pct}, loop=loop)
 
-        # 在线程池中运行同步代码
+        preview_data = await loop.run_in_executor(
+            None,
+            lambda: engine.preview(
+                source_text=payload.source_text,
+                topic=payload.topic,
+                fmt=payload.format,
+                enable_thinking=payload.enable_thinking,
+                progress=on_progress,
+            )
+        )
+
+        task["status"] = "awaiting_confirm"
+        task["message"] = "设计方案已生成，请确认"
+        task["progress"] = 25
+        task["preview_data"] = preview_data
+        _notify_ws(task_id, {"stage": "awaiting_confirm", "message": "设计方案已生成，请确认", "progress": 25, "status": "awaiting_confirm"}, loop=loop)
+
+    except Exception as e:
+        logger.exception("Preview 任务 %s 失败", task_id)
+        task["status"] = "error"
+        task["message"] = f"设计方案生成失败: {e}"
+        task["progress"] = 0
+        _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
+
+
+async def _run_execute(task_id: str, payload: ConfirmPayload):
+    """Steps 5-7: 执行生成"""
+    task = tasks[task_id]
+    preview_data = task.get("preview_data", {})
+
+    try:
+        cfg = ConfigManager.load()
+        engine = PPTEngine(cfg)
+
         loop = asyncio.get_event_loop()
+
+        def on_progress(stage, msg, pct):
+            # 映射到全局进度 (25-100)
+            global_pct = 25 + int(pct * 0.75)
+            task["stage"] = stage
+            task["message"] = msg
+            task["progress"] = global_pct
+            _notify_ws(task_id, {"stage": stage, "message": msg, "progress": global_pct}, loop=loop)
+
+        project_path = preview_data.get("project_path")
+        spec_lock = payload.spec_lock or preview_data.get("spec_lock", "")
+        confirmations = payload.confirmations
+
+        # 检查用户是否修改了 Eight Confirmations
+        original_cf = preview_data.get("eight_confirmations", {})
+        need_regenerate = (confirmations != original_cf)
+
+        if need_regenerate:
+            logger.info("用户修改了 Eight Confirmations, 重新生成 spec_lock")
+            regen_result = await loop.run_in_executor(
+                None,
+                lambda: engine.confirm_and_regenerate(
+                    project_path_str=project_path,
+                    user_modifications=confirmations,
+                    enable_thinking=payload.enable_thinking,
+                    progress=on_progress,
+                )
+            )
+            spec_lock = regen_result["spec_lock"]
+
+        # 使用用户确认的 page_plan（含 replan 后的结果）
+        user_page_plan = preview_data.get("page_plan")
+
+        result_path = await loop.run_in_executor(
+            None,
+            lambda: engine.execute(
+                project_path_str=project_path,
+                spec_lock=spec_lock,
+                page_plan=user_page_plan,
+                enable_thinking=payload.enable_thinking,
+                progress=on_progress,
+            )
+        )
+
+        task["status"] = "done"
+        task["progress"] = 100
+        task["message"] = "PPT生成完成!"
+        task["result_path"] = str(result_path)
+        _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
+
+    except Exception as e:
+        logger.exception("Execute 任务 %s 失败", task_id)
+        task["status"] = "error"
+        task["message"] = f"生成失败: {e}"
+        task["progress"] = 0
+        _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
+
+
+async def _run_generate(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
+    """一步到位(向后兼容)"""
+    task = tasks[task_id]
+    try:
+        engine = PPTEngine(cfg)
+
+        loop = asyncio.get_event_loop()
+
+        def on_progress(stage, msg, pct):
+            task["stage"] = stage
+            task["message"] = msg
+            task["progress"] = pct
+            _notify_ws(task_id, {"stage": stage, "message": msg, "progress": pct}, loop=loop)
+
         result_path = await loop.run_in_executor(
             None,
             lambda: engine.generate(
@@ -245,19 +751,11 @@ async def _run_task(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
         task["progress"] = 100
         task["message"] = "PPT生成完成!"
         task["result_path"] = str(result_path)
+        _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
 
     except Exception as e:
         logger.exception("任务 %s 失败", task_id)
         task["status"] = "error"
         task["message"] = f"生成失败: {e}"
         task["progress"] = 0
-
-
-def _dev_placeholder() -> str:
-    """开发模式占位页面"""
-    return """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>PPT-Web</title></head>
-<body style="font-family:sans-serif;text-align:center;padding:80px;background:#0f172a;color:#e2e8f0">
-<h1>🎨 PPT-Web</h1><p>前端未构建，请先 <code>cd frontend && npm run build</code></p>
-<p>或直接访问 <a href="/docs" style="color:#60a5fa">/docs</a> 查看API文档</p>
-</body></html>"""
+        _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())

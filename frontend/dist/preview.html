@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PPT-Web SVG预览编辑</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--dim:#94a3b8;--accent:#3b82f6;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+.layout{display:flex;height:100vh}
+/* 左侧幻灯片列表 */
+.sidebar{width:180px;background:var(--card);border-right:1px solid var(--border);overflow-y:auto;flex:none;padding:10px}
+.sidebar h3{font-size:.85em;color:var(--dim);margin-bottom:8px;padding:0 4px}
+.slide-item{padding:8px 10px;border-radius:6px;cursor:pointer;font-size:.8em;margin-bottom:4px;transition:background .15s;display:flex;align-items:center;gap:6px}
+.slide-item:hover{background:rgba(59,130,246,.1)}
+.slide-item.active{background:var(--accent);color:#fff}
+.slide-item .badge{background:var(--warn);color:#000;border-radius:4px;padding:1px 5px;font-size:.7em;margin-left:auto}
+/* 中间SVG画布 */
+.canvas-area{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.toolbar{display:flex;gap:8px;padding:8px 12px;background:var(--card);border-bottom:1px solid var(--border);align-items:center}
+.toolbar .nav-btn{background:var(--border);border:none;color:var(--text);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.85em}
+.toolbar .nav-btn:disabled{opacity:.3;cursor:not-allowed}
+.toolbar .nav-info{color:var(--dim);font-size:.85em;min-width:80px;text-align:center}
+.toolbar .spacer{flex:1}
+.toolbar .action-btn{padding:6px 14px;border:none;border-radius:6px;font-size:.85em;cursor:pointer;font-weight:600}
+.btn-save{background:var(--ok);color:#fff}
+.btn-rebuild{background:var(--accent);color:#fff}
+.btn-download{background:var(--accent2);color:#fff}
+.btn-back{background:var(--border);color:var(--text)}
+#svg-container{flex:1;overflow:auto;display:flex;align-items:center;justify-content:center;padding:16px;background:#1a1a2e}
+#svg-content{max-width:100%;max-height:100%}
+#svg-content svg{max-width:100%;height:auto;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+/* SVG 选中高亮 */
+:global .svg-selectable{cursor:pointer;transition:opacity .15s}
+:global .svg-selectable:hover{opacity:.8;filter:brightness(1.2)}
+:global .svg-selected{outline:2px solid var(--accent);outline-offset:2px;filter:brightness(1.1)}
+/* 右侧属性面板 */
+.props-panel{width:280px;background:var(--card);border-left:1px solid var(--border);overflow-y:auto;flex:none;padding:12px}
+.props-panel h3{font-size:.85em;color:var(--dim);margin-bottom:8px}
+.selected-info{font-size:.85em;padding:8px;background:rgba(59,130,246,.1);border-radius:6px;margin-bottom:12px}
+.selected-info .el-tag{color:var(--accent);font-weight:600}
+.selected-info .el-id{color:var(--dim);font-size:.8em}
+.empty-hint{color:var(--dim);font-size:.85em;text-align:center;padding:20px 0}
+.prop-table{width:100%;font-size:.8em;border-collapse:collapse;margin-bottom:12px}
+.prop-table td{padding:4px 6px;border-bottom:1px solid var(--border)}
+.prop-table td:first-child{color:var(--dim);width:60px}
+.prop-table input{width:100%;background:#0f172a;border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:.85em}
+.prop-table input:focus{border-color:var(--accent)}
+.edit-section{margin-top:12px}
+.edit-section label{display:block;font-size:.8em;color:var(--dim);margin-bottom:4px}
+.edit-section textarea{width:100%;background:#0f172a;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:.85em;min-height:60px;resize:vertical}
+.edit-section textarea:focus{border-color:var(--accent)}
+.apply-btn{width:100%;margin-top:8px;padding:8px;background:var(--ok);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:.9em}
+.apply-btn:hover{opacity:.9}
+.apply-btn:disabled{opacity:.3;cursor:not-allowed}
+/* Toast */
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:.9em;z-index:9999;animation:slideIn .3s}
+.toast-ok{background:var(--ok);color:#fff}
+.toast-err{background:var(--err);color:#fff}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <h3>📄 幻灯片</h3>
+    <div id="slideList"></div>
+  </div>
+  <div class="canvas-area">
+    <div class="toolbar">
+      <button class="nav-btn" id="navPrev" onclick="navSlide(-1)">◀</button>
+      <span class="nav-info" id="navInfo">— / —</span>
+      <button class="nav-btn" id="navNext" onclick="navSlide(1)">▶</button>
+      <div class="spacer"></div>
+      <button class="action-btn btn-rebuild" onclick="rebuildPptx()">🔄 重新导出</button>
+      <a class="action-btn btn-download" id="downloadBtn" href="#">📥 下载PPTX</a>
+      <button class="action-btn btn-back" onclick="goBack()">← 返回</button>
+    </div>
+    <div id="svg-container">
+      <div id="svg-content"></div>
+    </div>
+  </div>
+  <div class="props-panel">
+    <h3>🔍 元素属性</h3>
+    <div id="selectedInfo" class="empty-hint">点击SVG元素查看属性</div>
+    <div id="propEditor" style="display:none">
+      <div class="selected-info" id="selectedDetail"></div>
+      <table class="prop-table" id="propTable"></table>
+      <div class="edit-section" id="textEditSection" style="display:none">
+        <label>✏️ 修改文字内容</label>
+        <textarea id="textEditValue"></textarea>
+        <button class="apply-btn" onclick="applyTextChange()">应用修改</button>
+      </div>
+      <div class="edit-section" id="colorEditSection" style="display:none">
+        <label>🎨 修改颜色</label>
+        <input type="color" id="colorEditValue">
+        <button class="apply-btn" onclick="applyColorChange()">应用颜色</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const params = new URLSearchParams(location.search);
+const taskId = params.get('task') || '';
+const SKIP_TAGS = new Set(['defs','style','title','desc','clippath','lineargradient','radialgradient','pattern','filter','mask']);
+
+let slides = [];
+let currentSlide = '';
+let selectedEl = null;
+let svgRoot = null;
+
+// ── 初始化 ──
+async function init() {
+  if (!taskId) { toast('缺少task参数','err'); return; }
+  document.getElementById('downloadBtn').href = '/api/download/' + taskId;
+  await loadSlides();
+}
+init();
+
+// ── 加载幻灯片列表 ──
+async function loadSlides() {
+  try {
+    const r = await fetch('/api/preview/' + taskId + '/slides');
+    const d = await r.json();
+    slides = d.slides || [];
+    const list = document.getElementById('slideList');
+    list.innerHTML = '';
+    if (!slides.length) { list.innerHTML = '<div class="empty-hint">暂无幻灯片</div>'; return; }
+    slides.forEach((s,i) => {
+      const div = document.createElement('div');
+      div.className = 'slide-item';
+      div.textContent = s.name;
+      div.onclick = () => selectSlide(s.name);
+      list.appendChild(div);
+    });
+    selectSlide(slides[0].name);
+  } catch(e) { toast('加载失败: '+e.message,'err'); }
+}
+
+// ── 选择幻灯片 ──
+async function selectSlide(name) {
+  currentSlide = name;
+  document.querySelectorAll('.slide-item').forEach((el,i) => {
+    el.classList.toggle('active', slides[i] && slides[i].name === name);
+  });
+  updateNav();
+  try {
+    const r = await fetch('/api/preview/' + taskId + '/slide/' + encodeURIComponent(name));
+    const d = await r.json();
+    if (d.error) { toast(d.error,'err'); return; }
+    const container = document.getElementById('svg-content');
+    container.innerHTML = d.content;
+    svgRoot = container.querySelector('svg');
+    if (svgRoot) setupInteraction();
+    clearSelection();
+  } catch(e) { toast('加载SVG失败: '+e.message,'err'); }
+}
+
+// ── 导航 ──
+function updateNav() {
+  const idx = slides.findIndex(s => s.name === currentSlide);
+  document.getElementById('navInfo').textContent = slides.length ? (idx+1)+' / '+slides.length : '— / —';
+  document.getElementById('navPrev').disabled = idx <= 0;
+  document.getElementById('navNext').disabled = idx >= slides.length - 1;
+}
+function navSlide(delta) {
+  const idx = slides.findIndex(s => s.name === currentSlide);
+  const ni = idx + delta;
+  if (ni >= 0 && ni < slides.length) selectSlide(slides[ni].name);
+}
+
+// ── SVG交互 ──
+function setupInteraction() {
+  if (!svgRoot) return;
+  svgRoot.querySelectorAll('*').forEach(el => {
+    const tag = el.tagName.toLowerCase();
+    if (SKIP_TAGS.has(tag) || el === svgRoot) return;
+    el.classList.add('svg-selectable');
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      selectElement(el);
+    });
+  });
+  svgRoot.addEventListener('click', () => clearSelection());
+}
+
+function selectElement(el) {
+  clearSelection();
+  selectedEl = el;
+  el.classList.add('svg-selected');
+  showProps(el);
+}
+
+function clearSelection() {
+  if (selectedEl) selectedEl.classList.remove('svg-selected');
+  selectedEl = null;
+  document.getElementById('selectedInfo').style.display = '';
+  document.getElementById('selectedInfo').textContent = '点击SVG元素查看属性';
+  document.getElementById('propEditor').style.display = 'none';
+}
+
+function showProps(el) {
+  const tag = el.tagName.toLowerCase();
+  const id = el.getAttribute('id') || '(无id)';
+  document.getElementById('selectedInfo').style.display = 'none';
+  document.getElementById('propEditor').style.display = '';
+  document.getElementById('selectedDetail').innerHTML =
+    '<span class="el-tag">&lt;' + tag + '&gt;</span> <span class="el-id">' + id + '</span>';
+
+  // 属性表
+  const table = document.getElementById('propTable');
+  table.innerHTML = '';
+  const attrs = ['x','y','width','height','cx','cy','r','rx','ry','x1','y1','x2','y2','d','points',
+                  'fill','stroke','stroke-width','opacity','font-size','font-family','text-anchor',
+                  'transform','viewBox','preserveAspectRatio'];
+  attrs.forEach(a => {
+    const v = el.getAttribute(a);
+    if (v !== null && v !== undefined) {
+      table.innerHTML += '<tr><td>'+a+'</td><td>'+v+'</td></tr>';
+    }
+  });
+  // 显示textContent
+  const text = el.textContent && el.textContent.trim();
+  if (text) {
+    table.innerHTML += '<tr><td>text</td><td>'+text.substring(0,80)+'</td></tr>';
+  }
+
+  // 文字编辑
+  const isText = tag === 'text' || tag === 'tspan';
+  document.getElementById('textEditSection').style.display = isText ? '' : 'none';
+  if (isText) document.getElementById('textEditValue').value = text || '';
+
+  // 颜色编辑
+  const fill = el.getAttribute('fill');
+  const stroke = el.getAttribute('stroke');
+  const hasColor = (fill && fill !== 'none' && !fill.startsWith('url')) || (stroke && stroke !== 'none' && !stroke.startsWith('url'));
+  document.getElementById('colorEditSection').style.display = hasColor ? '' : 'none';
+  if (hasColor && fill && fill !== 'none') document.getElementById('colorEditValue').value = toHex(fill);
+  else if (hasColor && stroke) document.getElementById('colorEditValue').value = toHex(stroke);
+}
+
+// ── 修改文字 ──
+function applyTextChange() {
+  if (!selectedEl) return;
+  const newText = document.getElementById('textEditValue').value;
+  // 处理tspan子元素
+  const tspans = selectedEl.querySelectorAll('tspan');
+  if (tspans.length > 0) {
+    tspans[0].textContent = newText;
+  } else {
+    selectedEl.textContent = newText;
+  }
+  toast('文字已修改（记得点保存）','ok');
+  showProps(selectedEl);
+}
+
+// ── 修改颜色 ──
+function applyColorChange() {
+  if (!selectedEl) return;
+  const color = document.getElementById('colorEditValue').value;
+  selectedEl.setAttribute('fill', color);
+  toast('颜色已修改（记得点保存）','ok');
+  showProps(selectedEl);
+}
+
+// ── 保存SVG ──
+async function saveCurrentSlide() {
+  if (!svgRoot || !currentSlide) return;
+  const content = new XMLSerializer().serializeToString(svgRoot);
+  try {
+    const r = await fetch('/api/preview/' + taskId + '/save', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name: currentSlide, content: content})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error,'err'); return; }
+    toast('已保存','ok');
+  } catch(e) { toast('保存失败: '+e.message,'err'); }
+}
+
+// ── 重新导出PPTX ──
+async function rebuildPptx() {
+  // 先保存当前修改
+  if (svgRoot && currentSlide) {
+    const content = new XMLSerializer().serializeToString(svgRoot);
+    await fetch('/api/preview/' + taskId + '/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name:currentSlide, content})
+    });
+  }
+  toast('正在重新导出PPTX...','ok');
+  try {
+    const r = await fetch('/api/preview/' + taskId + '/rebuild', {method:'POST'});
+    const d = await r.json();
+    if (d.error) { toast(d.error,'err'); return; }
+    toast('PPTX已重新导出！','ok');
+  } catch(e) { toast('导出失败: '+e.message,'err'); }
+}
+
+// ── 工具 ──
+function toHex(c) {
+  if (!c) return '#000000';
+  if (c.startsWith('#') && (c.length===7||c.length===4)) return c.length===4 ?
+    '#'+c[1]+c[1]+c[2]+c[2]+c[3]+c[3] : c;
+  // rgb() → hex
+  const m = c.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  if (m) return '#'+[m[1],m[2],m[3]].map(x=>parseInt(x).toString(16).padStart(2,'0')).join('');
+  return '#000000';
+}
+function goBack() { location.href = '/'; }
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+</script>
+</body>
+</html>

@@ -42,7 +42,10 @@ def find_svg_files(
         else:
             return [], ''
 
-    return sorted(svg_dir.glob('*.svg')), dir_name
+    # 自然排序: page_02 < page_10 (字典序 page_10 < page_02 是错的)
+    def _natural_key(p):
+        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', p.name)]
+    return sorted(svg_dir.glob('*.svg'), key=_natural_key), dir_name
 
 
 def find_notes_files(

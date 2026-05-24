@@ -1,15 +1,20 @@
 """
-PPT生成引擎 — 直接复用 ppt-master 原项目脚本(通过subprocess调用)
-LLM 仅负责 Strategist(设计规划) 和 Executor(SVG生成) 两个环节
+PPT生成引擎 — 完整7步流水线，复用 ppt-master 脚本
+
+Step 1: 源内容处理 (file_parser / 文本)
+Step 2: 项目初始化 (project_manager.py init)
+Step 3: 模板选项 (默认跳过)
+Step 4: Strategist — Eight Confirmations + design_spec + spec_lock ⛔BLOCKING
+Step 5: 图片获取 (离线环境跳过)
+Step 6: Executor — LLM 逐页生成 SVG
+Step 7: 后处理 + 导出 PPTX
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
 import subprocess
 import sys
 import uuid
@@ -21,22 +26,14 @@ from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-# ppt-master 技能目录
 SKILL_DIR = Path(__file__).resolve().parents[2] / "skills" / "ppt-master"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 PROJECTS_DIR = Path(__file__).resolve().parents[2] / "projects"
 
 
 def _run_script(args: list[str], cwd: Optional[str] = None, timeout: int = 120) -> str:
-    """运行 ppt-master 脚本，返回 stdout"""
     logger.info("运行脚本: %s", " ".join(args))
-    result = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        timeout=timeout,
-    )
+    result = subprocess.run(args, capture_output=True, text=True, cwd=cwd, timeout=timeout)
     if result.returncode != 0:
         logger.error("脚本失败 (rc=%d): %s", result.returncode, result.stderr)
         raise RuntimeError(f"脚本执行失败: {result.stderr[:500]}")
@@ -44,16 +41,17 @@ def _run_script(args: list[str], cwd: Optional[str] = None, timeout: int = 120) 
 
 
 class PPTEngine:
-    """PPT生成引擎
+    """PPT生成引擎 — 完整7步流水线
 
-    流水线:
-      源内容 → 创建项目 → Strategist(LLM设计规划) → Executor(LLM逐页生成SVG)
-      → 后处理(脚本) → 导出PPTX(脚本)
+    对外暴露两个主要方法:
+    - preview() — Steps 1-4: 初始化 + Strategist, 返回 Eight Confirmations 供用户确认
+    - execute() — Steps 5-7: SVG生成 + 后处理 + 导出
+    - generate() — 一步到位(跳过确认, 向后兼容)
     """
 
     def __init__(self, llm_config: LLMConfig) -> None:
         self.llm = LLMClient(llm_config)
-        # 加载 strategist / executor 参考文档(只读一次)
+        # 只读一次参考文档
         self._strategist_ref = (SKILL_DIR / "references" / "strategist.md").read_text(encoding="utf-8")
         self._design_spec_ref = (SKILL_DIR / "templates" / "design_spec_reference.md").read_text(encoding="utf-8")
         self._spec_lock_ref = (SKILL_DIR / "templates" / "spec_lock_reference.md").read_text(encoding="utf-8")
@@ -61,38 +59,43 @@ class PPTEngine:
         self._shared_standards = (SKILL_DIR / "references" / "shared-standards.md").read_text(encoding="utf-8")
         self._executor_general = (SKILL_DIR / "references" / "executor-general.md").read_text(encoding="utf-8")
 
-    def generate(
+    # ══════════════════════════════════════════════════════════
+    #  公开 API
+    # ══════════════════════════════════════════════════════════
+
+    def preview(
         self,
         source_text: str,
         topic: str,
         fmt: str = "ppt169",
         enable_thinking: bool = False,
-        progress: Optional[Callable[[str, str, int], None]] = None,
-    ) -> Path:
-        """执行完整 PPT 生成流水线
+        progress: Optional[Callable] = None,
+    ) -> dict:
+        """Steps 1-4: 创建项目 + Strategist 设计规划
 
-        Args:
-            source_text: 源内容(Markdown或纯文本)
-            topic: PPT主题/标题
-            fmt: 画布格式, 默认 ppt169
-            progress: 进度回调 fn(stage, message, pct)
         Returns:
-            生成的 .pptx 文件路径
+            {
+                "project_path": str,
+                "project_name": str,
+                "eight_confirmations": dict,  # 八项确认(结构化)
+                "design_spec": str,           # design_spec.md 内容
+                "spec_lock": str,             # spec_lock.md 内容
+                "page_plan": list[dict],      # 解析后的页面计划
+            }
         """
-        def _prog(stage: str, msg: str, pct: int):
-            logger.info("[%s] %s (%d%%)", stage, msg, pct)
-            if progress:
-                progress(stage, msg, pct)
+        _prog = _make_progress(progress)
 
-        # ── Step 1: 创建项目 ──
-        _prog("init", "创建项目目录...", 5)
+        # ── Step 1: 源内容已就绪(由上层处理) ──
+        _prog("step1", "Step 1: 源内容已就绪", 5)
+
+        # ── Step 2: 项目初始化 ──
+        _prog("step2", "Step 2: 初始化项目...", 8)
         project_name = f"{topic[:30].replace(' ', '_')}_{uuid.uuid4().hex[:6]}"
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
         result = _run_script(
             [sys.executable, str(SCRIPTS_DIR / "project_manager.py"), "init", project_name, "--format", fmt, "--dir", str(PROJECTS_DIR)],
             timeout=30,
         )
-        # project_manager 返回实际目录名可能带后缀 (_ppt169_YYYYMMDD)
         actual_name = project_name
         for line in result.splitlines():
             if "Project created:" in line or "[OK] Project initialized:" in line:
@@ -106,27 +109,134 @@ class PPTEngine:
         sources_dir = project_path / "sources"
         sources_dir.mkdir(exist_ok=True)
         (sources_dir / "source.md").write_text(source_text, encoding="utf-8")
-        _prog("init", "项目创建完成", 10)
+        _prog("step2", f"项目已创建: {actual_name}", 10)
 
-        # ── Step 2: Strategist — LLM 生成 design_spec + spec_lock ──
-        _prog("strategist", "AI 正在规划PPT设计方案...", 15)
-        design_spec, spec_lock = self._run_strategist(source_text, topic, fmt, enable_thinking=enable_thinking)
+        # ── Step 3: 模板选项(默认跳过, free design) ──
+        _prog("step3", "Step 3: 使用自由设计模式", 12)
+
+        # ── Step 4: Strategist — Eight Confirmations + design_spec + spec_lock ──
+        _prog("step4", "Step 4: AI 正在规划设计方案...", 15)
+
+        eight_confirmations, design_spec, spec_lock = self._run_strategist(
+            source_text, topic, fmt, enable_thinking=enable_thinking
+        )
+
+        # 持久化到项目目录
         (project_path / "design_spec.md").write_text(design_spec, encoding="utf-8")
         (project_path / "spec_lock.md").write_text(spec_lock, encoding="utf-8")
-        _prog("strategist", "设计方案生成完成", 25)
 
-        # ── Step 3: Executor — LLM 逐页生成 SVG ──
-        _prog("executor", "AI 正在生成PPT页面...", 30)
         pages = self._parse_page_plan(spec_lock)
-        logger.info("page_plan 解析结果: %d 页, 源内容长度: %d", len(pages), len(source_text))
-        # 最小页数保护: 根据源内容长度确保足够页数
-        min_pages = 5  # 至少 cover + 3内容 + ending
+        logger.info("preview page_plan: %d 页", len(pages))
+
+        # 同步 eight_confirmations.page_count 与实际 page_plan 页数
+        actual_n = len(pages)
+        if actual_n > 0:
+            pc = eight_confirmations.get("page_count", {})
+            pc["recommended"] = actual_n
+            pc["min"] = min(pc.get("min", actual_n), actual_n)
+            pc["max"] = max(pc.get("max", actual_n), actual_n)
+            eight_confirmations["page_count"] = pc
+
+        if len(pages) <= 3:
+            # 调试: 打印 spec_lock 中 page_plan 部分
+            pp_match = __import__('re').search(r'##\s*page_plan(.*?)(?=\n##|\Z)', spec_lock, __import__('re').IGNORECASE | __import__('re').DOTALL)
+            if pp_match:
+                logger.warning("page_plan 原始内容(前800字):\n%s", pp_match.group(1)[:800])
+            else:
+                logger.warning("spec_lock 中未找到 page_plan section")
+        _prog("step4", f"设计方案完成, 规划 {len(pages)} 页", 25)
+
+        return {
+            "project_path": str(project_path),
+            "project_name": actual_name,
+            "eight_confirmations": eight_confirmations,
+            "design_spec": design_spec,
+            "spec_lock": spec_lock,
+            "page_plan": pages,
+            "source_text": source_text,
+            "topic": topic,
+        }
+
+    def confirm_and_regenerate(
+        self,
+        project_path_str: str,
+        user_modifications: dict,
+        enable_thinking: bool = False,
+        progress: Optional[Callable] = None,
+    ) -> dict:
+        """Step 4 续: 用户修改了 Eight Confirmations, 重新生成 spec_lock
+
+        Args:
+            project_path_str: 项目路径
+            user_modifications: 用户修改后的 Eight Confirmations JSON
+        """
+        _prog = _make_progress(progress)
+        project_path = Path(project_path_str)
+
+        _prog("step4_revise", "根据您的修改重新生成设计方案...", 18)
+
+        source_text = (project_path / "sources" / "source.md").read_text(encoding="utf-8")
+        topic = project_path.name.split("_")[0]
+        fmt = "ppt169"
+
+        spec_lock = self._regenerate_spec_lock(
+            source_text, topic, fmt, user_modifications, enable_thinking=enable_thinking
+        )
+
+        (project_path / "spec_lock.md").write_text(spec_lock, encoding="utf-8")
+        pages = self._parse_page_plan(spec_lock)
+        _prog("step4_revise", f"方案已更新, 规划 {len(pages)} 页", 25)
+
+        return {
+            "spec_lock": spec_lock,
+            "page_plan": pages,
+        }
+
+    def execute(
+        self,
+        project_path_str: str,
+        spec_lock: str,
+        page_plan: Optional[list[dict]] = None,
+        enable_thinking: bool = False,
+        progress: Optional[Callable] = None,
+    ) -> Path:
+        """Steps 5-7: Executor SVG生成 + 后处理 + 导出
+
+        Args:
+            project_path_str: 项目路径
+            spec_lock: spec_lock.md 内容(可能经过用户修改后重新生成)
+            page_plan: 用户确认的页面规划（优先于spec_lock中解析）
+        Returns:
+            生成的 .pptx 文件路径
+        """
+        _prog = _make_progress(progress)
+        project_path = Path(project_path_str)
+
+        # ── Step 5: 图片获取(离线环境跳过) ──
+        _prog("step5", "Step 5: 离线环境, 跳过图片获取", 27)
+
+        # ── Step 6: Executor — LLM 逐页生成 SVG ──
+        _prog("step6", "Step 6: AI 正在生成PPT页面...", 30)
+        # 优先使用用户确认的 page_plan，否则从 spec_lock 解析
+        pages = page_plan if page_plan else self._parse_page_plan(spec_lock)
+        # 安全排序：确保按 page_num 升序（封面在前）
+        pages.sort(key=lambda p: int(p.get("page_num", 0)))
+        logger.info("page_plan: %d 页 (来源: %s)", len(pages), "用户确认" if page_plan else "spec_lock解析")
+
+        # 最小页数保护
+        source_text = ""
+        src_file = project_path / "sources" / "source.md"
+        if src_file.exists():
+            source_text = src_file.read_text(encoding="utf-8")
+
+        min_pages = 5
         if len(source_text) > 500:
             min_pages = max(min_pages, 6)
         if len(source_text) > 1000:
             min_pages = max(min_pages, 8)
         if len(pages) < min_pages and len(source_text) > 200:
-            logger.warning("page_plan 只有 %d 页但源内容有 %d 字符，自动补充到 %d 页", len(pages), len(source_text), min_pages)
+            logger.warning("page_plan 只有 %d 页但源内容有 %d 字符，自动补充到 %d 页",
+                           len(pages), len(source_text), min_pages)
             while len(pages) < min_pages:
                 idx = len(pages) + 1
                 pages.append({
@@ -136,56 +246,98 @@ class PPTEngine:
                     "layout_hint": "end" if idx == min_pages else "content",
                     "key_points": source_text[:500],
                 })
+
         svg_output_dir = project_path / "svg_output"
         svg_output_dir.mkdir(exist_ok=True)
-
         total_pages = len(pages)
+
         for i, page_info in enumerate(pages):
-            pct = 30 + int((i / total_pages) * 50)
-            _prog("executor", f"正在生成第 {i+1}/{total_pages} 页: {page_info.get('title', '')}", pct)
-            svg_content = self._generate_svg_page(spec_lock, page_info, i, total_pages, enable_thinking=enable_thinking)
-            # 移除SVG动画元素（svg_to_pptx不支持animate）
-            svg_content = re.sub(r"<animate\b[^>]*/>", "", svg_content, flags=re.DOTALL)
-            svg_content = re.sub(r"<animate\b[^>]*>.*?</animate>", "", svg_content, flags=re.DOTALL)
+            pct = 30 + int((i / total_pages) * 45)
+            _prog("step6", f"正在生成第 {i+1}/{total_pages} 页: {page_info.get('title', '')}", pct)
+            svg_content = self._generate_svg_page(
+                spec_lock, page_info, i, total_pages, source_text, enable_thinking=enable_thinking
+            )
+            # 移除SVG动画元素（svg_to_pptx不支持 animate/animateTransform/animateMotion）
+            svg_content = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*/>", "", svg_content, flags=re.DOTALL)
+            svg_content = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*>.*?</animate(?:Transform|Motion)?>", "", svg_content, flags=re.DOTALL)
+
+            # 兜底：如果SVG缺少背景rect，自动补一个铺满viewBox的背景
+            if not re.search(r'<rect\b[^>]*\bwidth\s*=\s*["\']?1280["\']?', svg_content) and \
+               not re.search(r'<rect\b[^>]*\bwidth\s*=\s*["\']?960["\']?', svg_content):
+                svg_fmt = "ppt43" if "ppt43" in spec_lock else "ppt169"
+                _W, _H = ("960", "720") if svg_fmt == "ppt43" else ("1280", "720")
+                bg_color = self._extract_bg_color(spec_lock)
+                bg_rect = f'<rect x="0" y="0" width="{_W}" height="{_H}" fill="{bg_color}"/>'
+                # 插入到顶层 <g> 标签后
+                g_match = re.search(r'(<g\b[^>]*>)', svg_content)
+                if g_match:
+                    svg_content = svg_content[:g_match.end()] + "\n  " + bg_rect + svg_content[g_match.end():]
+                    logger.info("已为第 %d 页自动补充背景: %s", i+1, bg_color)
+
             fname = page_info.get("filename", f"slide_{i+1:02d}.svg")
+            # 安全校验：文件名不能含 JSON 残片、路径分隔符、引号等非法字符
+            if not fname or any(c in fname for c in '{}":\\/') or not fname.replace('_','').replace('-','').replace('.','').replace(' ','').isalnum():
+                fname = f"slide_{int(page_info.get('page_num', i+1)):02d}.svg"
+                logger.warning("非法文件名已修正: %s → %s", page_info.get('filename',''), fname)
             if not fname.endswith(".svg"):
                 fname += ".svg"
+            # 强制在文件名前加零填充序号，确保排序正确: 01_cover.svg, 02_summary.svg ...
+            fname_no_ext = fname[:-4]  # 去掉 .svg
+            # 如果已经有前导 NN_ 则跳过
+            if not re.match(r'^\d{2}_', fname_no_ext):
+                fname = f"{i+1:02d}_{fname_no_ext}.svg"
             (svg_output_dir / fname).write_text(svg_content, encoding="utf-8")
 
-        _prog("executor", f"全部 {total_pages} 页SVG生成完成", 80)
+        _prog("step6", f"全部 {total_pages} 页SVG生成完成", 76)
 
-        # ── Step 4: 后处理(直接调用原项目脚本) ──
-        _prog("postprocess", "正在后处理...", 82)
-        # 生成演讲备注
-        notes_md = self._generate_notes(spec_lock, source_text, topic, enable_thinking=enable_thinking)
-        (project_path / "notes" / "total.md").parent.mkdir(exist_ok=True)
+        # ── Step 6 续: 演讲备注 ──
+        notes_md = self._generate_notes(spec_lock, source_text, project_path.name, enable_thinking=enable_thinking)
+        (project_path / "notes").mkdir(exist_ok=True)
         (project_path / "notes" / "total.md").write_text(notes_md, encoding="utf-8")
 
-        # 拆分演讲备注（非关键步骤，失败不阻断流程）
+        # ── Step 7: 后处理 + 导出 ──
+        _prog("step7", "Step 7: 后处理...", 78)
+
+        # 7.1 拆分演讲备注（非关键，失败不阻断）
         try:
             _run_script([sys.executable, str(SCRIPTS_DIR / "total_md_split.py"), str(project_path)], timeout=30)
         except RuntimeError as e:
-            logger.warning(f"Notes split skipped: {e}")
+            logger.warning("Notes split skipped: %s", e)
 
-        _prog("postprocess", "SVG后处理...", 86)
-
+        # 7.2 SVG后处理
+        _prog("step7", "SVG后处理...", 82)
         _run_script([sys.executable, str(SCRIPTS_DIR / "finalize_svg.py"), str(project_path)], timeout=60)
 
-        # 清理 svg_final 中可能残留的 animate 元素
-        for svg_file in (project_path / "svg_final").glob("*.svg"):
-            content = svg_file.read_text(encoding="utf-8")
-            cleaned = re.sub(r"<animate\b[^>]*/>", "", content, flags=re.DOTALL)
-            cleaned = re.sub(r"<animate\b[^>]*>.*?</animate>", "", cleaned, flags=re.DOTALL)
-            if cleaned != content:
-                svg_file.write_text(cleaned, encoding="utf-8")
+        # 清理 svg_final 中可能残留的 animate/animateTransform/animateMotion 元素
+        svg_final_dir = project_path / "svg_final"
+        if svg_final_dir.exists():
+            for svg_file in svg_final_dir.glob("*.svg"):
+                content = svg_file.read_text(encoding="utf-8")
+                cleaned = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*/>", "", content, flags=re.DOTALL)
+                cleaned = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*>.*?</animate(?:Transform|Motion)?>", "", cleaned, flags=re.DOTALL)
+                if cleaned != content:
+                    logger.info("清除 %s 中的动画元素", svg_file.name)
+                    svg_file.write_text(cleaned, encoding="utf-8")
 
-        _prog("postprocess", "导出PPTX...", 90)
-
-        _run_script(
-            [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path)],
-            timeout=60,
-        )
-        _prog("postprocess", "导出完成", 95)
+        # 7.3 导出PPTX
+        _prog("step7", "导出PPTX...", 90)
+        try:
+            _run_script(
+                [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path)],
+                timeout=120,
+            )
+        except RuntimeError as e:
+            # native模式失败(如不支持的SVG元素), fallback到legacy模式
+            if "unsupported visual SVG element" in str(e) or "SvgNativeConversionError" in str(e):
+                logger.warning("native模式失败, fallback到legacy模式: %s", str(e)[:200])
+                _prog("step7", "native模式失败, 使用兼容模式导出...", 91)
+                _run_script(
+                    [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path), "--only", "legacy"],
+                    timeout=120,
+                )
+            else:
+                raise
+        _prog("step7", "导出完成!", 95)
 
         # 找到生成的 pptx
         exports_dir = project_path / "exports"
@@ -197,14 +349,38 @@ class PPTEngine:
 
         raise RuntimeError("PPTX 导出失败: 未找到输出文件")
 
-    # ────────────────── Strategist ──────────────────
+    def generate(
+        self,
+        source_text: str,
+        topic: str,
+        fmt: str = "ppt169",
+        enable_thinking: bool = False,
+        progress: Optional[Callable] = None,
+    ) -> Path:
+        """一步到位(向后兼容) — 完整流水线跳过用户确认"""
+        preview_result = self.preview(source_text, topic, fmt, enable_thinking, progress)
+        return self.execute(
+            preview_result["project_path"],
+            preview_result["spec_lock"],
+            preview_result.get("page_plan"),
+            enable_thinking,
+            progress,
+        )
 
-    def _run_strategist(self, source_text: str, topic: str, fmt: str, *, enable_thinking: bool = False) -> tuple[str, str]:
-        """调用 LLM 执行 Strategist 角色, 返回 (design_spec_md, spec_lock_md)"""
+    # ══════════════════════════════════════════════════════════
+    #  Step 4: Strategist
+    # ══════════════════════════════════════════════════════════
 
+    def _run_strategist(
+        self, source_text: str, topic: str, fmt: str, *, enable_thinking: bool = False
+    ) -> tuple[dict, str, str]:
+        """调用 LLM 执行 Strategist 角色
+
+        Returns: (eight_confirmations_dict, design_spec_md, spec_lock_md)
+        """
         system = (
             "你是顶级PPT策略规划师(Strategist)。你的任务是根据源内容生成PPT设计方案。\n\n"
-            "## 参考文档\n"
+            "## Strategist 角色定义\n"
             f"{self._strategist_ref[:6000]}\n\n"
             "## 设计规范模板(必须严格遵循此结构)\n"
             f"{self._design_spec_ref[:8000]}\n\n"
@@ -212,16 +388,37 @@ class PPTEngine:
             f"{self._spec_lock_ref[:4000]}\n"
         )
 
-        # 限制源内容长度避免超token
         truncated = source_text[:15000] + ("\n...(内容已截断)" if len(source_text) > 15000 else "")
 
         user_msg = (
             f"请为以下内容生成PPT设计方案。\n\n"
             f"## 主题: {topic}\n## 格式: {fmt}\n\n"
             f"## 源内容\n{truncated}\n\n"
-            "请输出两部分, 用 ===DESIGN_SPEC=== 和 ===SPEC_LOCK=== 分隔:\n\n"
-            "第一部分: design_spec.md (完整的设计规范文档, 包含所有XI个章节)\n"
-            "第二部分: spec_lock.md (机器可读的执行锁定文件)\n\n"
+            "请严格按照以下格式输出，分三部分:\n\n"
+            "===EIGHT_CONFIRMATIONS===\n"
+            "输出JSON格式的八项确认(严格遵守):\n"
+            "{\n"
+            '  "canvas_format": "PPT 16:9 (1280×720)",\n'
+            '  "page_count": {"min": 5, "max": 15, "recommended": 8},\n'
+            '  "target_audience": "目标受众描述",\n'
+            '  "style_objective": "风格目标描述",\n'
+            '  "color_scheme": {\n'
+            '    "primary": "#hex", "secondary": "#hex",\n'
+            '    "accent": "#hex", "background": "#hex",\n'
+            '    "text": "#hex", "description": "配色说明"\n'
+            '  },\n'
+            '  "icon_usage": "图标使用策略",\n'
+            '  "typography": {\n'
+            '    "heading_font": "字体名", "heading_size": "28-36px",\n'
+            '    "body_font": "字体名", "body_size": "14-18px",\n'
+            '    "description": "字体方案说明"\n'
+            '  },\n'
+            '  "image_usage": "图片使用策略"\n'
+            "}\n\n"
+            "===DESIGN_SPEC===\n"
+            "完整的 design_spec.md (包含所有XI个章节)\n\n"
+            "===SPEC_LOCK===\n"
+            "完整的 spec_lock.md (机器可读的执行锁定文件)\n\n"
             "要求:\n"
             f"- 画布格式: {fmt}\n"
             "- 页数规则(严格遵守):\n"
@@ -231,117 +428,266 @@ class PPTEngine:
             "  · 如果源内容超过500字，页数不应少于6页；超过1000字不应少于8页\n"
             "  · 如果源内容有明确的章节/小标题，每个章节至少1页\n"
             "- 风格: 专业商务风(通用), 配色协调\n"
-            "- 每页在 spec_lock 的 page_plan 中必须有: page_num, title, filename, layout_hint, key_points\n"
-            "- 不需要用户确认, 直接生成最佳方案\n"
-            "- page_plan 中必须包含至少: 1页封面(cover) + 若干内容页 + 1页结束页(ending)。\n"
+            "- spec_lock 的 page_plan 中每页必须有: page_num, title, filename, layout_hint, key_points\n"
+            "- page_plan 必须包含: 1页封面(cover) + 若干内容页 + 1页结束页(ending)\n"
         )
 
-        resp = self.llm.chat([{"role": "user", "content": user_msg}], system_prompt=system, enable_thinking=enable_thinking)
+        resp = self.llm.chat(
+            [{"role": "user", "content": user_msg}],
+            system_prompt=system,
+            enable_thinking=enable_thinking,
+        )
 
-        # 拆分两部分
-        design_spec, spec_lock = self._split_response(resp)
-        return design_spec, spec_lock
+        # 解析三部分
+        eight_cf, design_spec, spec_lock = self._split_strategist_response(resp)
+        return eight_cf, design_spec, spec_lock
 
-    # ────────────────── Executor ──────────────────
+    def _regenerate_spec_lock(
+        self,
+        source_text: str,
+        topic: str,
+        fmt: str,
+        user_modifications: dict,
+        *,
+        enable_thinking: bool = False,
+    ) -> str:
+        """用户修改 Eight Confirmations 后, 重新生成 spec_lock"""
+        system = (
+            "你是顶级PPT策略规划师(Strategist)。用户已确认并修改了设计方案。\n"
+            "请根据用户确认的方案生成新的 spec_lock.md。\n\n"
+            "## spec_lock 模板\n"
+            f"{self._spec_lock_ref[:4000]}\n"
+        )
+
+        truncated = source_text[:15000] + ("\n...(内容已截断)" if len(source_text) > 15000 else "")
+
+        user_msg = (
+            f"## 主题: {topic}\n## 格式: {fmt}\n\n"
+            f"## 源内容\n{truncated}\n\n"
+            f"## 用户确认的设计方案\n{json.dumps(user_modifications, ensure_ascii=False, indent=2)}\n\n"
+            "请输出完整的 spec_lock.md，严格遵循用户确认的配色、字体、页数等方案。\n"
+            "- page_plan 每页必须有: page_num, title, filename, layout_hint, key_points\n"
+            "- 只输出 spec_lock 内容，不要其他解释\n"
+        )
+
+        resp = self.llm.chat(
+            [{"role": "user", "content": user_msg}],
+            system_prompt=system,
+            enable_thinking=enable_thinking,
+        )
+        return resp.strip()
+
+    def replan_page_plan(
+        self, source_text: str, topic: str, spec_lock: str, target_pages: int, *, enable_thinking: bool = False
+    ) -> list[dict]:
+        """用户调整页数后，让LLM重新规划 page_plan"""
+        truncated = source_text[:12000] + ("\n...(内容已截断)" if len(source_text) > 12000 else "")
+
+        system = (
+            "你是PPT策略规划师。用户调整了页数，请根据新的页数要求重新规划页面内容分配。\n\n"
+            "## 原始 spec_lock (颜色/字体/画布等保持不变)\n"
+            f"{spec_lock[:6000]}\n"
+        )
+
+        user_msg = (
+            f"## 主题: {topic}\n"
+            f"## 源内容\n{truncated}\n\n"
+            f"## 要求\n"
+            f"- 总页数必须是 **{target_pages}** 页（包含封面和结束页）\n"
+            f"- 第1页必须是封面(cover)，最后一页必须是结束页(ending)\n"
+            f"- 根据源内容合理分配每页的主题，不要遗漏重要内容\n"
+            f"- 每页要有明确的标题和2-3个要点\n\n"
+            "## 输出格式\n"
+            "严格输出JSON数组，每个元素包含:\n"
+            '```json\n'
+            '[\n'
+            '  {"page_num": 1, "title": "封面标题", "filename": "slide_01_cover.svg", '
+            '"layout_hint": "cover", "key_points": "副标题/日期等"},\n'
+            '  {"page_num": 2, "title": "内容页标题", "filename": "slide_02_content.svg", '
+            '"layout_hint": "content", "key_points": "要点1, 要点2, 要点3"},\n'
+            '  ...\n'
+            ']\n'
+            '```\n'
+            "只输出JSON数组，不要其他文字。\n"
+        )
+
+        resp = self.llm.chat(
+            messages=[{"role": "user", "content": user_msg}],
+            system_prompt=system,
+            enable_thinking=enable_thinking,
+        )
+
+        # 解析LLM返回的JSON数组
+        try:
+            # 尝试直接解析
+            pages = json.loads(resp.strip())
+            if isinstance(pages, list) and len(pages) > 0:
+                pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                return pages
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试从文本中提取JSON数组
+        m = re.search(r"\[.*\]", resp, re.DOTALL)
+        if m:
+            try:
+                pages = json.loads(m.group())
+                if isinstance(pages, list) and len(pages) > 0:
+                    pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                    return pages
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("replan LLM返回解析失败，回退到前端调整")
+        return []
+
+    # ══════════════════════════════════════════════════════════
+    #  Step 6: Executor
+    # ══════════════════════════════════════════════════════════
 
     def _parse_page_plan(self, spec_lock: str) -> list[dict]:
-        """从 spec_lock 中解析页面计划
-
-        支持三种格式:
-        1. JSON 数组: page_plan: [...]
-        2. YAML 列表: ## page_plan 后跟多个 - page_num: N 条目
-        3. Markdown 列表: 1. xxx 或 - Page N
-        """
+        """从 spec_lock 中解析页面计划 (支持 JSON/YAML/Markdown 三种格式)"""
         pages: list[dict] = []
 
-        # ── 方式1: JSON 数组 ──
-        try:
-            match = re.search(r"page_plan\s*[:=]\s*", spec_lock, re.IGNORECASE)
-            if match:
-                rest = spec_lock[match.end():]
-                json_match = re.search(r"(\[.*?\])", rest, re.DOTALL)
-                if json_match:
-                    pages = json.loads(json_match.group(1))
-                    if pages:
-                        return pages
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning("JSON page_plan 解析失败: %s", e)
+        # 提取 page_plan section 文本
+        pp_section = re.search(
+            r"##\s*page_plan\s*\n(.*?)(?=\n##\s|\Z)",
+            spec_lock, re.IGNORECASE | re.DOTALL,
+        )
+        section_text = pp_section.group(1) if pp_section else ""
 
-        # ── 方式2: YAML 列表格式 - page_num: N ... ──
-        # 匹配 ## page_plan 之后的内容，提取每个 "- page_num:" 开头的块
+        # 方式1: JSON 数组 (用括号平衡匹配, 不用非贪婪)
+        if section_text:
+            json_match = re.search(r"\[", section_text)
+            if json_match:
+                # 括号平衡找到完整的 JSON 数组
+                start = json_match.start()
+                depth = 0
+                end = start
+                for i, ch in enumerate(section_text[start:], start):
+                    if ch == '[':
+                        depth += 1
+                    elif ch == ']':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                try:
+                    pages = json.loads(section_text[start:end])
+                    if isinstance(pages, list) and pages and isinstance(pages[0], dict):
+                        # 清理字段值：确保 title/filename 是字符串
+                        for p in pages:
+                            for k, v in p.items():
+                                if isinstance(v, str):
+                                    p[k] = v.strip().strip('"').strip("'")
+                        pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                        logger.info("JSON page_plan 解析成功: %d 页", len(pages))
+                        return pages
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning("JSON page_plan 解析失败: %s", e)
+
+        # 方式2: YAML 列表格式 (- page_num: N ...)
         try:
-            pp_section = re.search(
-                r"##\s*page_plan\s*\n(.*?)(?=\n##\s|\Z)",
-                spec_lock, re.IGNORECASE | re.DOTALL,
-            )
             if pp_section:
-                blocks = re.split(r"\n(?=-\s+page_num\s*:)", pp_section.group(1).strip())
-                for block in blocks:
-                    block = block.strip()
-                    if not block.startswith("-"):
-                        continue
-                    info: dict = {}
-                    for line in block.split("\n"):
-                        line = line.strip().lstrip("- ")
-                        if not line:
+                # 只有包含 "page_num:" 才走 YAML 路径
+                section_text_2 = pp_section.group(1)
+                if "page_num:" in section_text_2 or "page_num :" in section_text_2:
+                    blocks = re.split(r"\n(?=-\s*page_num\s*:)", section_text_2.strip())
+                    for block in blocks:
+                        block = block.strip()
+                        if not block.startswith("-"):
                             continue
-                        if ":" not in line:
-                            continue
-                        key, _, val = line.partition(":")
-                        key = key.strip().lower().replace(" ", "_")
-                        val = val.strip()
-                        info[key] = val
-                    if info:
-                        try:
-                            info["page_num"] = int(re.sub(r"\D", "", str(info.get("page_num", "0"))))
-                        except (ValueError, TypeError):
-                            pass
-                        pages.append(info)
-                if pages:
-                    logger.info("YAML page_plan 解析成功: %d 页", len(pages))
-                    return pages
+                        info: dict = {}
+                        for line in block.split("\n"):
+                            line = line.strip().lstrip("- ")
+                            if not line or ":" not in line:
+                                continue
+                            key, _, val = line.partition(":")
+                            key = key.strip().lower().replace(" ", "_")
+                            info[key] = val.strip()
+                        if info:
+                            try:
+                                info["page_num"] = int(re.sub(r"\D", "", str(info.get("page_num", "0"))))
+                            except (ValueError, TypeError):
+                                pass
+                            pages.append(info)
+                    if pages:
+                        logger.info("YAML page_plan 解析成功: %d 页", len(pages))
+                        pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                        return pages
         except Exception as e:
             logger.warning("YAML page_plan 解析失败: %s", e)
 
-        # ── 方式3: Markdown 列表 ──
+        # 方式3: 逗号分隔格式 "- N: title, filename, layout, desc"
+        try:
+            if pp_section:
+                for line in pp_section.group(1).strip().split("\n"):
+                    line = line.strip()
+                    # 匹配 "- 1: cover, ..." 或 "- page_num: 1, ..."
+                    m = re.match(r"-\s*(\d+)\s*:\s*(.+)", line)
+                    if m:
+                        parts = [p.strip().strip('"').strip("'") for p in m.group(2).split(",")]
+                        title = parts[0] if parts else f"第{m.group(1)}页"
+                        filename = parts[1] if len(parts) > 1 else f"slide_{int(m.group(1)):02d}.svg"
+                        layout = parts[2] if len(parts) > 2 else "content"
+                        kp = parts[3] if len(parts) > 3 else ""
+                        pages.append({
+                            "page_num": int(m.group(1)),
+                            "title": title,
+                            "filename": filename if filename.endswith(".svg") else filename + ".svg",
+                            "layout_hint": layout,
+                            "key_points": kp,
+                        })
+                if pages:
+                    logger.info("逗号分隔 page_plan 解析成功: %d 页", len(pages))
+                    pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                    return pages
+        except Exception as e:
+            logger.warning("逗号分隔 page_plan 解析失败: %s", e)
+
+        # 方式4: Markdown 列表 "1. xxx" 或 "- Page N"
         for i, line in enumerate(spec_lock.split("\n")):
             line = line.strip()
             if re.match(r"^\d+\.\s+|^-?\s*\*?\s*Page\s+\d+", line, re.IGNORECASE):
                 title = re.sub(r"^[-*\d.\s]+", "", line).strip()
                 pages.append({
-                    "page_num": i + 1,
-                    "title": title,
+                    "page_num": i + 1, "title": title,
                     "filename": f"slide_{i+1:02d}.svg",
-                    "layout_hint": "content",
-                    "key_points": title,
+                    "layout_hint": "content", "key_points": title,
                 })
-
         if pages:
             return pages
 
-        # ── 最终回退: 从标题数推断 ──
-        heading_pattern = re.compile(r"^#{1,3}\s+\S", re.MULTILINE)
-        headings = heading_pattern.findall(spec_lock)
+        # 回退: 从标题数推断
+        headings = re.findall(r"^#{1,3}\s+\S", spec_lock, re.MULTILINE)
         estimated = max(3, min(len(headings), 20))
         logger.warning("page_plan 解析失败, 从标题推断 %d 页", estimated)
-        pages = [
+        return [
             {"page_num": i, "title": f"第{i}页", "filename": f"slide_{i:02d}.svg",
              "layout_hint": "cover" if i == 1 else ("end" if i == estimated else "content"),
              "key_points": ""}
             for i in range(1, estimated + 1)
         ]
-        return pages
+
+    @staticmethod
+    def _extract_bg_color(spec_lock: str) -> str:
+        """从 spec_lock 中提取背景色，找不到则返回白色"""
+        # 匹配 background: #XXX 或 bg_color: #XXX 或 background_color: ...
+        m = re.search(r'(?:background|bg[_ ]?color)\s*[:=]\s*["\']?\s*(#[0-9a-fA-F]{3,8})', spec_lock, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # 匹配 color_scheme 里的 background 字段
+        m = re.search(r'"background"\s*:\s*"(#[0-9a-fA-F]{3,8})"', spec_lock)
+        if m:
+            return m.group(1)
+        return "#FFFFFF"
 
     def _generate_svg_page(
-        self, spec_lock: str, page_info: dict, page_idx: int, total: int, *, enable_thinking: bool = False
+        self, spec_lock: str, page_info: dict, page_idx: int, total: int, source_text: str = "", *, enable_thinking: bool = False
     ) -> str:
         """调用 LLM 为单页生成 SVG"""
-
-        # 画布尺寸
-        fmt = "ppt169"
-        if "ppt43" in spec_lock:
-            fmt = "ppt43"
-        W, H = ("1280", "720") if fmt == "ppt169" else ("960", "720")
+        fmt = "ppt43" if "ppt43" in spec_lock else "ppt169"
+        W, H = ("960", "720") if fmt == "ppt43" else ("1280", "720")
 
         system = (
             "你是PPT执行者(Executor)，负责生成单个SVG页面。\n\n"
@@ -353,32 +699,73 @@ class PPTEngine:
             f"{self._executor_general[:3000]}\n"
         )
 
+        # 从源内容中提取与当前页相关的段落
+        source_excerpt = ""
+        if source_text:
+            title = page_info.get("title", "")
+            kp = page_info.get("key_points", "")
+            # 优先取包含标题/关键词的段落，最多3000字
+            relevant = []
+            for para in source_text.split("\n\n"):
+                if any(kw in para for kw in title.split() + kp.split(",")[:5]) or not relevant:
+                    relevant.append(para)
+                if len("\n\n".join(relevant)) > 3000:
+                    break
+            source_excerpt = "\n\n".join(relevant[:8])[:3000]
+
         user_msg = (
             f"请为以下页面生成完整的SVG代码。\n\n"
             f"## 当前项目 spec_lock\n{spec_lock[:8000]}\n\n"
             f"## 当前页信息\n"
-            f"- 页码: {page_idx+1}/{total}\n"
+            f"- 页码: {page_info.get('page_num', page_idx+1)}/{total}\n"
             f"- 标题: {page_info.get('title', '')}\n"
             f"- 布局提示: {page_info.get('layout_hint', 'content')}\n"
             f"- 要点: {page_info.get('key_points', '')}\n\n"
+        )
+        if source_excerpt:
+            user_msg += (
+                f"## 源内容参考(必须从中提取实际文字填入SVG)\n{source_excerpt}\n\n"
+                "**重要**: 必须从上面源内容中提取真实的文字内容填入SVG的<text>元素，"
+                "不要自己编造内容。每页至少包含3-5个文字元素（标题、副标题、要点、数据等）。\n\n"
+            )
+        user_msg += (
             f"## 要求\n"
             f"- SVG viewBox='0 0 {W} {H}', xmlns='http://www.w3.org/2000/svg'\n"
             f"- 使用spec_lock中定义的颜色、字体\n"
-            f"- 必须有 id='page_{page_idx+1}' 的顶层 <g> 元素\n"
+            f"- 必须有 id='page_{page_info.get('page_num', page_idx+1)}' 的顶层 <g> 元素\n"
+            f"- **必须包含背景**: 第一个子元素必须是铺满整个viewBox的<rect>(x=0 y=0 width={W} height={H}), 使用spec_lock中的背景色或渐变\n"
             f"- 文字使用 <text> 元素, 不用 <foreignObject>\n"
-            f"- 所有元素必须有 id 属性用于动画\n"
-            f"- 只输出SVG代码, 不要任何解释\n"
+            f"- 只输出SVG代码, 不要任何解释\n\n"
+            f"## 禁止事项(会导致生成失败)\n"
+            f"- 禁止使用 <animate>, <animateTransform>, <animateMotion> 元素\n"
+            f"- 禁止使用 <foreignObject> 元素\n"
+            f"- 禁止中英文混用: 源内容是中文则所有文字必须是中文\n"
+            f"- 禁止自行添加英文翻译或英文注释\n"
+            f"- 禁止让图表/图形超出 viewBox 范围, 所有坐标和尺寸必须控制在 0~{W}(宽) 和 0~{H}(高) 之间\n"
         )
 
-        resp = self.llm.chat([{"role": "user", "content": user_msg}], system_prompt=system, enable_thinking=enable_thinking)
+        # 封面页特殊要求
+        if page_info.get("layout_hint") == "cover" or page_idx == 0:
+            user_msg += (
+                "\n## 封面页特殊要求\n"
+                "- 必须包含: 主标题(<text>元素,字号≥36px), 副标题(<text>元素,字号≥18px)\n"
+                "- 主标题文字来自源内容主题, 副标题可以是日期/单位等\n"
+                "- 封面背景必须充满整个viewBox(width=100% height=100% 或等效坐标)\n"
+                "- 绝对不能只有背景没有文字\n"
+            )
 
-        # 提取 SVG
+        resp = self.llm.chat(
+            [{"role": "user", "content": user_msg}],
+            system_prompt=system,
+            enable_thinking=enable_thinking,
+        )
         return self._extract_svg(resp)
 
-    # ────────────────── Notes ──────────────────
+    # ══════════════════════════════════════════════════════════
+    #  Notes
+    # ══════════════════════════════════════════════════════════
 
     def _generate_notes(self, spec_lock: str, source_text: str, topic: str, *, enable_thinking: bool = False) -> str:
-        """LLM 生成演讲备注"""
         system = "你是PPT演讲备注撰写专家。为每页PPT撰写简洁的演讲备注。"
         user_msg = (
             f"为以下PPT生成演讲备注(total.md格式)。\n\n"
@@ -387,33 +774,78 @@ class PPTEngine:
             "格式: 每页以 '## 第N页: 标题' 开头, 然后写2-4句备注。\n"
             "最后用 '## 全文备注' 汇总所有页。"
         )
-        return self.llm.chat([{"role": "user", "content": user_msg}], system_prompt=system, enable_thinking=enable_thinking)
+        return self.llm.chat(
+            [{"role": "user", "content": user_msg}],
+            system_prompt=system,
+            enable_thinking=enable_thinking,
+        )
 
-    # ────────────────── 辅助 ──────────────────
+    # ══════════════════════════════════════════════════════════
+    #  辅助
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _split_strategist_response(resp: str) -> tuple[dict, str, str]:
+        """拆分 Strategist 返回的三部分: Eight Confirmations + design_spec + spec_lock"""
+        # 默认值
+        eight_cf = {}
+        design_spec = ""
+        spec_lock = ""
+
+        # 提取 Eight Confirmations JSON
+        ec_match = re.search(r"===EIGHT_CONFIRMATIONS===\s*\n(.*?)(?====DESIGN_SPEC===|\Z)", resp, re.DOTALL)
+        if ec_match:
+            ec_text = ec_match.group(1).strip()
+            # 提取 JSON 块
+            json_match = re.search(r"\{.*\}", ec_text, re.DOTALL)
+            if json_match:
+                try:
+                    eight_cf = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    logger.warning("Eight Confirmations JSON 解析失败")
+
+        # 提取 design_spec
+        ds_match = re.search(r"===DESIGN_SPEC===\s*\n(.*?)(?====SPEC_LOCK===|\Z)", resp, re.DOTALL)
+        if ds_match:
+            design_spec = ds_match.group(1).strip()
+
+        # 提取 spec_lock
+        sl_match = re.search(r"===SPEC_LOCK===\s*\n(.*)", resp, re.DOTALL)
+        if sl_match:
+            spec_lock = sl_match.group(1).strip()
+
+        # 回退: 如果没找到标记，用旧逻辑
+        if not spec_lock and not design_spec:
+            design_spec, spec_lock = PPTEngine._split_response(resp)
+
+        return eight_cf, design_spec, spec_lock
 
     @staticmethod
     def _split_response(resp: str) -> tuple[str, str]:
-        """拆分 LLM 返回的 design_spec + spec_lock"""
+        """旧逻辑回退: 拆分 design_spec + spec_lock"""
         sep = "===SPEC_LOCK==="
         if sep in resp:
             parts = resp.split(sep, 1)
-            design = parts[0].replace("===DESIGN_SPEC===", "").strip()
-            lock = parts[1].strip()
-            return design, lock
-        # 回退: 按长度大致对半分
+            return parts[0].replace("===DESIGN_SPEC===", "").strip(), parts[1].strip()
         mid = len(resp) // 2
         return resp[:mid], resp[mid:]
 
     @staticmethod
     def _extract_svg(text: str) -> str:
-        """从 LLM 回复中提取 SVG 内容"""
-        # 直接是 <svg ...>...</svg>
         if "<svg" in text:
             start = text.index("<svg")
             end = text.rindex("</svg>") + 6
             return text[start:end]
-        # markdown 代码块
         m = re.search(r"```(?:xml|svg)?\s*\n(.*?)```", text, re.DOTALL)
         if m:
             return m.group(1).strip()
         return text.strip()
+
+
+def _make_progress(progress: Optional[Callable] = None) -> Callable:
+    """创建进度回调"""
+    def _prog(stage: str, msg: str, pct: int):
+        logger.info("[%s] %s (%d%%)", stage, msg, pct)
+        if progress:
+            progress(stage, msg, pct)
+    return _prog
