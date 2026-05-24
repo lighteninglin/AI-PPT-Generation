@@ -20,6 +20,7 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
+import xml.etree.ElementTree as ET
 
 from .config import LLMConfig
 from .llm_client import LLMClient
@@ -36,7 +37,7 @@ def _run_script(args: list[str], cwd: Optional[str] = None, timeout: int = 120) 
     result = subprocess.run(args, capture_output=True, text=True, cwd=cwd, timeout=timeout)
     if result.returncode != 0:
         logger.error("脚本失败 (rc=%d): %s", result.returncode, result.stderr)
-        raise RuntimeError(f"脚本执行失败: {result.stderr[:500]}")
+        raise RuntimeError(f"脚本执行失败: {result.stderr[:2000]}")
     return result.stdout
 
 
@@ -219,33 +220,41 @@ class PPTEngine:
         _prog("step6", "Step 6: AI 正在生成PPT页面...", 30)
         # 优先使用用户确认的 page_plan，否则从 spec_lock 解析
         pages = page_plan if page_plan else self._parse_page_plan(spec_lock)
+        # 防御：过滤掉非 dict 元素（LLM 有时返回混合类型）
+        if pages:
+            bad = [p for p in pages if not isinstance(p, dict)]
+            if bad:
+                logger.warning("page_plan 中有 %d 个非 dict 元素，已过滤: %s", len(bad), bad[:3])
+            pages = [p for p in pages if isinstance(p, dict)]
         # 安全排序：确保按 page_num 升序（封面在前）
         pages.sort(key=lambda p: int(p.get("page_num", 0)))
         logger.info("page_plan: %d 页 (来源: %s)", len(pages), "用户确认" if page_plan else "spec_lock解析")
 
-        # 最小页数保护
+        # 读取源文本（后续 _generate_svg_page 需要）
         source_text = ""
         src_file = project_path / "sources" / "source.md"
         if src_file.exists():
             source_text = src_file.read_text(encoding="utf-8")
 
-        min_pages = 5
-        if len(source_text) > 500:
-            min_pages = max(min_pages, 6)
-        if len(source_text) > 1000:
-            min_pages = max(min_pages, 8)
-        if len(pages) < min_pages and len(source_text) > 200:
-            logger.warning("page_plan 只有 %d 页但源内容有 %d 字符，自动补充到 %d 页",
-                           len(pages), len(source_text), min_pages)
-            while len(pages) < min_pages:
-                idx = len(pages) + 1
-                pages.append({
-                    "page_num": idx,
-                    "title": f"第{idx}页",
-                    "filename": f"slide_{idx:02d}.svg",
-                    "layout_hint": "end" if idx == min_pages else "content",
-                    "key_points": source_text[:500],
-                })
+        # 最小页数保护 — 仅当 page_plan 来自 spec_lock 自动解析（非用户确认）时生效
+        if not page_plan:
+            min_pages = 5
+            if len(source_text) > 500:
+                min_pages = max(min_pages, 6)
+            if len(source_text) > 1000:
+                min_pages = max(min_pages, 8)
+            if len(pages) < min_pages and len(source_text) > 200:
+                logger.warning("page_plan 只有 %d 页但源内容有 %d 字符，自动补充到 %d 页",
+                               len(pages), len(source_text), min_pages)
+                while len(pages) < min_pages:
+                    idx = len(pages) + 1
+                    pages.append({
+                        "page_num": idx,
+                        "title": f"第{idx}页",
+                        "filename": f"slide_{idx:02d}.svg",
+                        "layout_hint": "end" if idx == min_pages else "content",
+                        "key_points": source_text[:500],
+                    })
 
         svg_output_dir = project_path / "svg_output"
         svg_output_dir.mkdir(exist_ok=True)
@@ -286,6 +295,26 @@ class PPTEngine:
             # 如果已经有前导 NN_ 则跳过
             if not re.match(r'^\d{2}_', fname_no_ext):
                 fname = f"{i+1:02d}_{fname_no_ext}.svg"
+            # ── XML 校验: 确保保存的 SVG 是合法 XML ──
+            try:
+                ET.fromstring(svg_content)
+            except ET.ParseError as e:
+                logger.warning("第 %d 页SVG XML非法，尝试修复: %s", i+1, e)
+                # 尝试修复：移除非法字符、补全缺失标签
+                fixed = svg_content
+                # 移除 XML 声明前的非法字节
+                fixed = re.sub(r'^[^<]+', '', fixed)
+                # 确保以 </svg> 结尾
+                if '</svg>' not in fixed:
+                    fixed = fixed.rstrip() + '\n</svg>'
+                # 尝试再次解析
+                try:
+                    ET.fromstring(fixed)
+                    svg_content = fixed
+                    logger.info("第 %d 页SVG XML修复成功", i+1)
+                except ET.ParseError:
+                    logger.error("第 %d 页SVG XML修复失败，跳过此页", i+1)
+                    continue
             (svg_output_dir / fname).write_text(svg_content, encoding="utf-8")
 
         _prog("step6", f"全部 {total_pages} 页SVG生成完成", 76)
@@ -327,9 +356,19 @@ class PPTEngine:
                 timeout=120,
             )
         except RuntimeError as e:
-            # native模式失败(如不支持的SVG元素), fallback到legacy模式
-            if "unsupported visual SVG element" in str(e) or "SvgNativeConversionError" in str(e):
-                logger.warning("native模式失败, fallback到legacy模式: %s", str(e)[:200])
+            err_msg = str(e)
+            # native模式失败(如不支持的SVG元素、XML解析错误), fallback到legacy模式
+            fallback_keywords = [
+                "unsupported visual SVG element",
+                "SvgNativeConversionError",
+                "ParseError",
+                "not well-formed",
+                "unclosed token",
+                "no element found",
+                "mismatched tag",
+            ]
+            if any(kw in err_msg for kw in fallback_keywords):
+                logger.warning("native模式失败, fallback到legacy模式: %s", err_msg[:200])
                 _prog("step7", "native模式失败, 使用兼容模式导出...", 91)
                 _run_script(
                     [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path), "--only", "legacy"],
@@ -521,20 +560,35 @@ class PPTEngine:
         try:
             # 尝试直接解析
             pages = json.loads(resp.strip())
-            if isinstance(pages, list) and len(pages) > 0:
-                pages.sort(key=lambda p: int(p.get("page_num", 0)))
-                return pages
+            if isinstance(pages, list) and pages:
+                # 只保留 dict 元素，过滤字符串等
+                pages = [p for p in pages if isinstance(p, dict)]
+                if pages:
+                    pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                    return pages
         except json.JSONDecodeError:
             pass
 
-        # 尝试从文本中提取JSON数组
-        m = re.search(r"\[.*\]", resp, re.DOTALL)
-        if m:
+        # 尝试从文本中提取JSON数组（括号平衡匹配，防止截断）
+        json_start = resp.find('[')
+        if json_start >= 0:
+            depth = 0
+            end = json_start
+            for idx, ch in enumerate(resp[json_start:], json_start):
+                if ch == '[':
+                    depth += 1
+                elif ch == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end = idx + 1
+                        break
             try:
-                pages = json.loads(m.group())
-                if isinstance(pages, list) and len(pages) > 0:
-                    pages.sort(key=lambda p: int(p.get("page_num", 0)))
-                    return pages
+                pages = json.loads(resp[json_start:end])
+                if isinstance(pages, list) and pages:
+                    pages = [p for p in pages if isinstance(p, dict)]
+                    if pages:
+                        pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                        return pages
             except json.JSONDecodeError:
                 pass
 
@@ -617,6 +671,51 @@ class PPTEngine:
                         return pages
         except Exception as e:
             logger.warning("YAML page_plan 解析失败: %s", e)
+
+        # 方式2.5: YAML inline-object 格式: - page_NN: { title: "...", filename: "...", ... }
+        try:
+            if pp_section:
+                section_text_25 = pp_section.group(1)
+                if re.search(r'-\s*page[_\s]*\d+\s*:\s*\{', section_text_25):
+                    for line in section_text_25.strip().split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        m = re.match(r'-\s*page[_\s]*(\d+)\s*:\s*\{(.+)\}\s*$', line)
+                        if not m:
+                            continue
+                        page_num = int(m.group(1))
+                        obj_str = m.group(2)
+                        info: dict = {"page_num": page_num}
+                        # 提取各字段（用正则从 inline object 中提取）
+                        for field, default in [
+                            ("title", f"第{page_num}页"),
+                            ("filename", f"slide_{page_num:02d}.svg"),
+                            ("layout_hint", "content"),
+                        ]:
+                            fm = re.search(rf'{field}\s*:\s*"([^"]*)"', obj_str)
+                            if fm:
+                                val = fm.group(1).strip()
+                                info[field] = val if val else default
+                            elif field not in info:
+                                info[field] = default
+                        # key_points: ["...", "..."] → 逗号连接
+                        kp_m = re.search(r'key_points\s*:\s*\[(.+?)\]', obj_str)
+                        if kp_m:
+                            points = re.findall(r'"([^"]*)"', kp_m.group(1))
+                            info["key_points"] = ", ".join(points) if points else ""
+                        else:
+                            info["key_points"] = ""
+                        # filename 补 .svg
+                        if not info["filename"].endswith(".svg"):
+                            info["filename"] += ".svg"
+                        pages.append(info)
+                    if pages:
+                        logger.info("YAML inline-object page_plan 解析成功: %d 页", len(pages))
+                        pages.sort(key=lambda p: int(p.get("page_num", 0)))
+                        return pages
+        except Exception as e:
+            logger.warning("YAML inline-object page_plan 解析失败: %s", e)
 
         # 方式3: 逗号分隔格式 "- N: title, filename, layout, desc"
         try:

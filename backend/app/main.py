@@ -6,6 +6,7 @@ Step 4 (Eight Confirmations) 需要 ⛔BLOCKING 用户交互确认
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -203,34 +204,46 @@ def get_task(task_id: str):
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
-    return task
+    return {"id": task_id, **task}
 
 
 @app.get("/api/download/{task_id}")
 def download_pptx(task_id: str):
+    # 优先从内存查找
     task = tasks.get(task_id)
-    if not task or task["status"] != "done":
-        raise HTTPException(404, "PPTX 尚未生成完成")
-    path = Path(task["result_path"])
-    if not path.exists():
-        raise HTTPException(404, "文件已丢失")
-    return FileResponse(
-        str(path), filename=path.name,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
+    if task and task.get("status") == "done" and task.get("result_path"):
+        path = Path(task["result_path"])
+        if path.exists():
+            return FileResponse(
+                str(path), filename=path.name,
+                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+    # fallback: 从项目目录的 exports/ 中找最新的 pptx
+    try:
+        project_dir = _get_project_dir(task_id)
+    except HTTPException:
+        raise HTTPException(404, "PPTX 尚未生成完成或任务不存在")
+    exports_dir = project_dir / "exports"
+    if exports_dir.exists():
+        pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if pptx_files:
+            return FileResponse(
+                str(pptx_files[0]), filename=pptx_files[0].name,
+                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+    raise HTTPException(404, "PPTX 文件未找到")
 
 
 @app.get("/api/preview/{task_id}")
 def preview_svg(task_id: str):
     """返回SVG预览编辑页面"""
-    task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(404, "任务不存在")
+    # 验证项目目录存在（不依赖内存 tasks）
+    project_dir = _get_project_dir(task_id)
     html_path = FRONTEND_DIST / "svg-editor.html"
     if not html_path.exists():
         raise HTTPException(500, "SVG编辑器未部署")
     html = html_path.read_text(encoding="utf-8")
-    # 注入下载链接
+    # 注入 API 路径和 task_id
     html = html.replace('id="download-link" href="#"', f'id="download-link" href="/api/download/{task_id}"')
     return HTMLResponse(html)
 
@@ -310,21 +323,38 @@ async def ws_task_progress(ws: WebSocket, task_id: str):
 # ── SVG 预览/编辑 API ──
 
 def _get_project_dir(task_id: str) -> Path:
-    """从任务字典获取项目目录，失败抛 HTTPException"""
+    """从任务字典获取项目目录，失败抛 HTTPException
+    
+    支持三种查找方式：
+    1. 内存 tasks 字典（容器未重启时有效）
+    2. 精确目录名匹配
+    3. 模糊匹配（task_id 是目录名的子串，如 '623b10' 匹配 '..._623b10_ppt169_...'）
+    """
     task = tasks.get(task_id)
+    if task:
+        result_path = task.get("result_path")
+        if result_path:
+            project_dir = Path(result_path).parent.parent
+            if project_dir.exists():
+                return project_dir
+        preview_data = task.get("preview_data") or {}
+        project_path = preview_data.get("project_path")
+        if project_path and Path(project_path).exists():
+            return Path(project_path)
+
+    # fallback 1: task_id 可能就是项目目录名，在 projects/ 下直接找
+    for projects_root in [PROJECTS_DIR, PROJECTS_DIR / "projects", Path("/app/projects")]:
+        candidate = projects_root / task_id
+        if candidate.is_dir():
+            return candidate
+        # fallback 2: 模糊匹配 — task_id 是目录名的子串（如短 UUID 匹配完整目录名）
+        if projects_root.is_dir():
+            for d in projects_root.iterdir():
+                if d.is_dir() and task_id in d.name:
+                    return d
+
     if not task:
-        raise HTTPException(404, "任务不存在")
-    result_path = task.get("result_path")
-    if result_path:
-        # result_path 指向 exports/xxx.pptx，项目目录是其祖父级
-        project_dir = Path(result_path).parent.parent
-        if project_dir.exists():
-            return project_dir
-    # fallback: 从 preview_data 获取
-    preview_data = task.get("preview_data") or {}
-    project_path = preview_data.get("project_path")
-    if project_path and Path(project_path).exists():
-        return Path(project_path)
+        raise HTTPException(404, f"任务不存在 (id={task_id})")
     raise HTTPException(404, "项目目录不存在")
 
 
@@ -678,9 +708,17 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
         spec_lock = payload.spec_lock or preview_data.get("spec_lock", "")
         confirmations = payload.confirmations
 
-        # 检查用户是否修改了 Eight Confirmations
+        # 检查用户是否修改了 Eight Confirmations（排除 page_count，它已通过 replan 处理）
         original_cf = preview_data.get("eight_confirmations", {})
-        need_regenerate = (confirmations != original_cf)
+        # 深拷贝后去掉 page_count 再比较，因为页数变化已由 replan 处理
+        cf_without_pages = copy.deepcopy(confirmations)
+        orig_without_pages = copy.deepcopy(original_cf)
+        cf_without_pages.pop("page_count", None)
+        orig_without_pages.pop("page_count", None)
+        need_regenerate = (cf_without_pages != orig_without_pages)
+
+        # 用户 replan 后的 page_plan（如果有）
+        replanned_page_plan = preview_data.get("page_plan")
 
         if need_regenerate:
             logger.info("用户修改了 Eight Confirmations, 重新生成 spec_lock")
@@ -694,6 +732,14 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
                 )
             )
             spec_lock = regen_result["spec_lock"]
+            # 如果用户已经 replan 过，优先使用 replan 的 page_plan，不用 regenerate 产生的
+            # 因为 replan 是用户明确调整页数后的结果，regenerate 只是样式微调
+            if replanned_page_plan:
+                logger.info("使用用户 replan 后的 page_plan (%d 页)，而非 regenerate 的 (%d 页)",
+                            len(replanned_page_plan), len(regen_result.get("page_plan", [])))
+            else:
+                replanned_page_plan = regen_result.get("page_plan")
+                preview_data["page_plan"] = replanned_page_plan
 
         # 使用用户确认的 page_plan（含 replan 后的结果）
         user_page_plan = preview_data.get("page_plan")
