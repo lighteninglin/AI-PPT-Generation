@@ -322,6 +322,50 @@ async def ws_task_progress(ws: WebSocket, task_id: str):
 
 # ── SVG 预览/编辑 API ──
 
+# ── SVG 编辑 ID 注入（不破坏原始 SVG 文本） ──
+
+_edit_id_counter = 0
+
+def _add_edit_ids_raw(svg_text: str) -> tuple[str, list[dict]]:
+    """直接在原始 SVG 文本上用正则给元素添加 _edit_N id，不经过 ET 解析。
+    
+    这样保留原始引号风格（单引号属性值），避免 ET.tostring 的 &quot; 问题。
+    """
+    global _edit_id_counter
+    _edit_id_counter = 0
+    annotations = []
+    
+    # 匹配 SVG 可编辑元素（排除 defs, linearGradient, stop, style 等）
+    editable_tags = {"svg", "g", "rect", "circle", "ellipse", "line", "path", "text", "polygon", "polyline", "image"}
+    
+    def _add_id(match):
+        global _edit_id_counter
+        indent = match.group(1) or ""
+        tag = match.group(2)
+        attrs = match.group(3)
+        
+        if tag.lower() not in editable_tags:
+            return match.group(0)
+        
+        # 已经有 id 的跳过
+        if re.search(r'\bid\s*=\s*[\'"]', attrs):
+            return match.group(0)
+        
+        _edit_id_counter += 1
+        new_id = f"_edit_{_edit_id_counter}"
+        return f'{indent}<{tag} id="{new_id}"{attrs}>'
+    
+    # 匹配开始标签：<tag ...> 或 <tag .../>  (不匹配结束标签 </tag>)
+    result = re.sub(
+        r'^(\s*)<(svg|g|rect|circle|ellipse|line|path|text|polygon|polyline|image)\b((?:[^>]|"[^"]*"|\'[^\']*\')*)>',
+        _add_id,
+        svg_text,
+        flags=re.MULTILINE,
+    )
+    
+    return result, annotations
+
+
 def _get_project_dir(task_id: str) -> Path:
     """从任务字典获取项目目录，失败抛 HTTPException
     
@@ -368,13 +412,13 @@ def _safe_svg_name(name: str) -> str:
 
 
 def _svg_dir_for(project_dir: Path) -> Path:
-    """返回可用SVG目录 (svg_final 优先, fallback svg_output)"""
+    """返回可用SVG目录 (svg_output 优先以保留原始引号风格, fallback svg_final)"""
+    svg_output = project_dir / "svg_output"
+    if svg_output.exists() and any(svg_output.glob("*.svg")):
+        return svg_output
     svg_final = project_dir / "svg_final"
     if svg_final.exists() and any(svg_final.glob("*.svg")):
         return svg_final
-    svg_output = project_dir / "svg_output"
-    if svg_output.exists():
-        return svg_output
     raise HTTPException(404, "SVG 尚未生成")
 
 
@@ -412,20 +456,26 @@ def get_slide(task_id: str, name: str):
     # 解析SVG并分配临时ID
     root = None
     try:
-        tree = ET.parse(str(svg_path))
-        root = tree.getroot()
-        assign_temp_ids(root)
-        disk_annotations = parse_annotations(root)
-        # ET.tostring 会把默认命名空间变成 ns0: 前缀, 浏览器不认, 必须清除
-        content = ET.tostring(root, encoding="unicode", xml_declaration=False)
-        content = re.sub(r'\bns0:', '', content)
-        content = re.sub(r'\s+xmlns:ns0="[^"]*"', '', content)
-        # 确保 xmlns 在根元素上
-        if 'xmlns="http://www.w3.org/2000/svg"' not in content:
-            content = content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
-    except ET.ParseError:
-        content = svg_path.read_text(encoding="utf-8")
-        disk_annotations = []
+        # 方案A: 直接读原始文本, 用正则给元素添加 _edit_N id
+        raw_svg = svg_path.read_text(encoding="utf-8")
+        content, disk_annotations = _add_edit_ids_raw(raw_svg)
+    except Exception as e:
+        logger.warning("get_slide 方案A失败: %s → %s, fallback到ET", safe_name, e)
+        try:
+            # 方案B fallback: ET 解析（可能破坏引号风格）
+            tree = ET.parse(str(svg_path))
+            root = tree.getroot()
+            assign_temp_ids(root)
+            disk_annotations = parse_annotations(root)
+            content = ET.tostring(root, encoding="unicode", xml_declaration=False)
+            content = re.sub(r'\bns0:', '', content)
+            content = re.sub(r'\s+xmlns:ns0="[^"]*"', '', content)
+            content = content.replace('&quot;', "'")
+            if 'xmlns="http://www.w3.org/2000/svg"' not in content:
+                content = content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+        except ET.ParseError:
+            content = svg_path.read_text(encoding="utf-8")
+            disk_annotations = []
 
     if root is None:
         return {"name": safe_name, "content": content, "annotations": []}
