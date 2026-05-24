@@ -167,7 +167,7 @@ async def replan_pages(payload: ReplanPayload):
     )
 
     if new_pages:
-        pd["page_plan"] = new_pages
+        pd["replanned_pages"] = new_pages  # 存到独立key，不覆盖原始page_plan
         # 同步更新 eight_confirmations 的 page_count
         cf = pd.get("eight_confirmations", {})
         pc = cf.get("page_count", {})
@@ -766,9 +766,12 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
         cf_without_pages.pop("page_count", None)
         orig_without_pages.pop("page_count", None)
         need_regenerate = (cf_without_pages != orig_without_pages)
+        regen_result = None
 
-        # 用户 replan 后的 page_plan（如果有）
-        replanned_page_plan = preview_data.get("page_plan")
+        # 用户确认后的 page_plan
+        # 策略：如果用户没改过页数(replan没被调用)，始终用 preview 阶段原始解析的 page_plan
+        # 只有用户明确通过 replan API 调整了页数，才使用 replan 的结果
+        replanned_page_plan = preview_data.get("replanned_pages")  # 只有replan API才会设这个key
 
         if need_regenerate:
             logger.info("用户修改了 Eight Confirmations, 重新生成 spec_lock")
@@ -782,17 +785,18 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
                 )
             )
             spec_lock = regen_result["spec_lock"]
-            # 如果用户已经 replan 过，优先使用 replan 的 page_plan，不用 regenerate 产生的
-            # 因为 replan 是用户明确调整页数后的结果，regenerate 只是样式微调
-            if replanned_page_plan:
-                logger.info("使用用户 replan 后的 page_plan (%d 页)，而非 regenerate 的 (%d 页)",
-                            len(replanned_page_plan), len(regen_result.get("page_plan", [])))
-            else:
-                replanned_page_plan = regen_result.get("page_plan")
-                preview_data["page_plan"] = replanned_page_plan
 
-        # 使用用户确认的 page_plan（含 replan 后的结果）
-        user_page_plan = preview_data.get("page_plan")
+        # 优先用 replan 结果 > regenerate 结果 > preview 原始
+        if replanned_page_plan:
+            user_page_plan = replanned_page_plan
+            logger.info("使用用户 replan 后的 page_plan (%d 页)", len(replanned_page_plan))
+        elif need_regenerate and regen_result:
+            user_page_plan = regen_result.get("page_plan")
+            preview_data["page_plan"] = user_page_plan
+            logger.info("使用 regenerate 的 page_plan (%d 页)", len(user_page_plan or []))
+        else:
+            user_page_plan = preview_data.get("page_plan")
+            logger.info("使用 preview 原始 page_plan (%d 页)", len(user_page_plan or []))
 
         result_path = await loop.run_in_executor(
             None,

@@ -129,6 +129,17 @@ class PPTEngine:
         pages = self._parse_page_plan(spec_lock)
         logger.info("preview page_plan: %d 页", len(pages))
 
+        # ── 质量检查: 如果 page_plan 过于简略，自动调用 replan 补全 ──
+        if pages and self._is_low_quality_page_plan(pages):
+            logger.warning("page_plan 质量差(title简略/缺字段)，自动 replan 补全")
+            _prog("step4", "正在补全页面规划详情...", 20)
+            better_pages = self.replan_page_plan(
+                source_text, topic, spec_lock, len(pages), enable_thinking=enable_thinking
+            )
+            if better_pages and len(better_pages) == len(pages):
+                pages = better_pages
+                logger.info("replan 补全成功: %d 页", len(pages))
+
         # 同步 eight_confirmations.page_count 与实际 page_plan 页数
         actual_n = len(pages)
         if actual_n > 0:
@@ -599,6 +610,46 @@ class PPTEngine:
     #  Step 6: Executor
     # ══════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _is_low_quality_page_plan(pages: list[dict]) -> bool:
+        """检测 page_plan 是否质量差（title全是英文标识符、缺少关键字段等）
+
+        判定标准：
+        - 超过一半页的 title 是纯英文短标识符（如 cover, summary, ending）
+        - 或超过一半页缺少 filename 或 key_points
+        """
+        import unicodedata
+        weak_count = 0
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            title = (p.get("title") or "").strip()
+            fname = (p.get("filename") or "").strip()
+            kp = (p.get("key_points") or "").strip()
+
+            is_weak = False
+            # title 是纯英文短词（长度 ≤ 30，且无中文字符）
+            if title:
+                has_cjk = any('CJK' in unicodedata.name(ch, '') for ch in title)
+                if not has_cjk and len(title) <= 30:
+                    is_weak = True
+            else:
+                is_weak = True
+
+            # filename 是自动生成的（slide_NN.svg 格式，无语义）
+            if fname and re.match(r'^slide_\d+\.svg$', fname):
+                is_weak = True
+
+            # 缺少 key_points
+            if not kp:
+                is_weak = True
+
+            if is_weak:
+                weak_count += 1
+
+        # 超过一半的页质量差 → 判定为低质量
+        return weak_count > len(pages) * 0.5
+
     def _parse_page_plan(self, spec_lock: str) -> list[dict]:
         """从 spec_lock 中解析页面计划 (支持 JSON/YAML/Markdown 三种格式)"""
         pages: list[dict] = []
@@ -658,7 +709,11 @@ class PPTEngine:
                                 continue
                             key, _, val = line.partition(":")
                             key = key.strip().lower().replace(" ", "_")
-                            info[key] = val.strip()
+                            val = val.strip().strip('"').strip("'")
+                            if val.startswith("[") and val.endswith("]"):
+                                # key_points: ["a", "b"] → "a, b"
+                                val = ", ".join(re.findall(r'"([^"]*)"', val))
+                            info[key] = val
                         if info:
                             try:
                                 info["page_num"] = int(re.sub(r"\D", "", str(info.get("page_num", "0"))))
@@ -666,6 +721,11 @@ class PPTEngine:
                                 pass
                             pages.append(info)
                     if pages:
+                        for p in pages:
+                            fn = p.get("filename", "")
+                            if fn and not fn.endswith(".svg"):
+                                p["filename"] = fn + ".svg"
+                        pages = [p for p in pages if isinstance(p, dict)]
                         logger.info("YAML page_plan 解析成功: %d 页", len(pages))
                         pages.sort(key=lambda p: int(p.get("page_num", 0)))
                         return pages
@@ -902,6 +962,35 @@ class PPTEngine:
                     eight_cf = json.loads(json_match.group())
                 except json.JSONDecodeError:
                     logger.warning("Eight Confirmations JSON 解析失败")
+
+        # 补全缺失字段为合理默认值（弱模型可能返回不完整的JSON）
+        _EC_DEFAULTS = {
+            "canvas_format": "PPT 16:9 (1280×720)",
+            "page_count": {"min": 5, "max": 15, "recommended": 8},
+            "target_audience": "领导/高管",
+            "style_objective": "B) General Consulting — 数据清晰优先",
+            "color_scheme": {
+                "primary": "#1A56DB", "secondary": "#0E9F6E",
+                "accent": "#F59E0B", "background": "#0F172A",
+                "text": "#F8FAFC", "description": "专业商务深蓝配色",
+            },
+            "icon_usage": "C) Built-in icon library — 专业场景(推荐)",
+            "typography": {
+                "heading_font": "Microsoft YaHei, PingFang SC, sans-serif",
+                "heading_size": "32-40px",
+                "body_font": "Microsoft YaHei, PingFang SC, sans-serif",
+                "body_size": "18-22px",
+                "description": "微软雅黑系列，清晰专业",
+            },
+            "image_usage": "A) No images — 数据报告、流程文档",
+        }
+        for k, v in _EC_DEFAULTS.items():
+            if k not in eight_cf:
+                eight_cf[k] = v
+            elif isinstance(v, dict) and isinstance(eight_cf.get(k), dict):
+                for sk, sv in v.items():
+                    if sk not in eight_cf[k]:
+                        eight_cf[k][sk] = sv
 
         # 提取 design_spec
         ds_match = re.search(r"===DESIGN_SPEC===\s*\n(.*?)(?====SPEC_LOCK===|\Z)", resp, re.DOTALL)

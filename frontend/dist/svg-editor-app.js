@@ -874,7 +874,15 @@
     // ================================================================
     function sanitizeSvg(svgString) {
         var doc = new DOMParser().parseFromString(svgString, "image/svg+xml");
-        doc.querySelectorAll("script,foreignObject").forEach(function (el) { el.remove(); });
+        // 检查XML解析错误 — 复杂SVG可能包含浏览器严格XML模式不兼容的内容
+        var parseError = doc.querySelector("parsererror");
+        if (parseError) {
+            // XML解析失败, 直接返回原始文本（用innerHTML以HTML模式渲染, 更宽容）
+            console.warn("SVG XML parse error, falling back to raw HTML insert:", parseError.textContent.substring(0, 200));
+            return svgString;
+        }
+        doc.querySelectorAll("script").forEach(function (el) { el.remove(); });
+        doc.querySelectorAll("foreignObject").forEach(function (el) { el.remove(); });
         doc.querySelectorAll("*").forEach(function (el) {
             Array.from(el.attributes).forEach(function (attr) {
                 if (attr.name.indexOf("on") === 0) el.removeAttribute(attr.name);

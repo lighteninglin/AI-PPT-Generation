@@ -51,6 +51,10 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
 .cf-row{display:flex;gap:10px;align-items:center}
 .cf-row>label{margin:0;min-width:70px;font-size:.8em;flex:none}
 .cf-row>input,.cf-row>select{flex:1}
+.cb-wrap>input{flex:1}
+.cb-dropdown{display:none;position:absolute;left:80px;right:0;top:100%;z-index:100;background:#1e293b;border:1px solid var(--border);border-radius:6px;max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.cb-opt{padding:8px 12px;cursor:pointer;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cb-opt:hover{background:rgba(59,130,246,.2)}
 
 /* 颜色选择 */
 .color-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -287,12 +291,10 @@ function renderConfirmations(cf) {
      options:['PPT 16:9 (1280×720)','PPT 4:3 (960×720)','XHS 3:4 (1080×1440)']}
   ]);
 
-  // 2. 页数范围
+  // 2. 页数设置
   const pc = cf.page_count||{};
-  addCard(c, 2, '页数范围', [
-    {label:'推荐页数', key:'page_count.recommended', type:'number', value: pc.recommended||8, min:3, max:30, onchange:'adjustPagePlan()'},
-    {label:'最小', key:'page_count.min', type:'number', value: pc.min||5, min:1, max:30},
-    {label:'最大', key:'page_count.max', type:'number', value: pc.max||15, min:1, max:30}
+  addCard(c, 2, '页数设置', [
+    {label:'页数', key:'page_count.recommended', type:'number', value: pc.recommended||8, min:3, max:30, onchange:'adjustPagePlan()'}
   ]);
 
   // 3. 目标受众
@@ -367,12 +369,12 @@ function addCard(container, num, title, fields) {
       f.options.forEach(o => { html += `<option value="${o}" ${o===f.value?'selected':''}>${o}</option>`; });
       html += '</select></div>';
     } else if(f.type === 'combobox') {
-      const dlId = 'dl_' + f.key.replace(/[^a-zA-Z0-9]/g,'_');
-      html += `<div class="cf-row"><label>${f.label}</label>`;
-      html += `<input type="text" list="${dlId}" data-cf="${f.key}" value="${escHtml(f.value)}" placeholder="${f.placeholder||''}" oninput="markModified(${num})" autocomplete="off">`;
-      html += `<datalist id="${dlId}">`;
-      (f.options||[]).forEach(o => { html += `<option value="${escHtml(o)}">`; });
-      html += '</datalist></div>';
+      const cbId = 'cb_' + f.key.replace(/[^a-zA-Z0-9]/g,'_');
+      html += `<div class="cf-row cb-wrap" style="position:relative"><label>${f.label}</label>`;
+      html += `<input type="text" data-cf="${f.key}" id="${cbId}" value="${escHtml(f.value)}" placeholder="${f.placeholder||''}" oninput="markModified(${num});_cbFilter(this)" onfocus="_cbShowAll(this)" autocomplete="off">`;
+      html += `<div class="cb-dropdown" id="${cbId}_dd">`;
+      (f.options||[]).forEach(o => { html += `<div class="cb-opt" onmousedown="_cbSelect(event,'${cbId}',this)" data-val="${escHtml(o)}">${escHtml(o)}</div>`; });
+      html += '</div></div>';
     } else if(f.type === 'number') {
       html += `<div class="cf-row"><label>${f.label}</label><input type="number" data-cf="${f.key}" value="${f.value}" min="${f.min||1}" max="${f.max||99}" onchange="markModified(${num});${f.onchange||''}"></div>`;
     } else if(f.type === 'text') {
@@ -403,6 +405,46 @@ function markModified(num) {
 }
 
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+// ── 自定义 Combobox (替代 datalist, 始终显示全部选项) ──
+function _cbShowAll(input) {
+  // 聚焦时关闭其他下拉，展示全部选项
+  document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+  const dd = document.getElementById(input.id + '_dd');
+  if(!dd) return;
+  dd.querySelectorAll('.cb-opt').forEach(opt => opt.style.display='');
+  dd.style.display = 'block';
+  // 点击外部关闭
+  setTimeout(() => document.addEventListener('mousedown', _cbCloseOutside, {once:false}), 0);
+}
+function _cbCloseOutside(e) {
+  // 如果点击不在 combobox 内部，关闭所有下拉
+  if(!e.target.closest('.cb-wrap')) {
+    document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+  }
+  // 只在下拉可见时继续监听
+  const anyOpen = [...document.querySelectorAll('.cb-dropdown')].some(d => d.style.display==='block');
+  if(anyOpen) document.addEventListener('mousedown', _cbCloseOutside, {once:false});
+}
+function _cbFilter(input) {
+  const dd = document.getElementById(input.id + '_dd');
+  if(!dd) return;
+  const val = input.value.toLowerCase();
+  dd.querySelectorAll('.cb-opt').forEach(opt => {
+    opt.style.display = (!val || opt.dataset.val.toLowerCase().includes(val)) ? '' : 'none';
+  });
+  dd.style.display = 'block';
+  document.addEventListener('mousedown', _cbCloseOutside, {once:false});
+}
+function _cbSelect(e, inputId, opt) {
+  e.preventDefault(); // 阻止 blur 导致的关闭
+  const input = document.getElementById(inputId);
+  if(input) {
+    input.value = opt.dataset.val;
+    input.dispatchEvent(new Event('input', {bubbles:true}));
+  }
+  document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+}
 
 function collectConfirmations() {
   const result = {};
@@ -451,11 +493,19 @@ function renderPagePlan(pages) {
 
 // ── 页数调整时调用LLM重新规划 ──
 let _replanTimer = null;
+let _originalPageCount = null; // 记录初始推荐页数
 function adjustPagePlan() {
   if(!previewData || !currentTaskId) return;
   const el = document.querySelector('[data-cf="page_count.recommended"]');
   if(!el) return;
   const targetCount = Math.max(3, Math.min(30, parseInt(el.value)||8));
+
+  // 如果页数没变，不触发replan
+  if(_originalPageCount === null) _originalPageCount = targetCount;
+  if(targetCount === _originalPageCount) {
+    document.getElementById('pageList').style.opacity = '1';
+    return;
+  }
 
   // 先立即更新显示页数
   document.getElementById('pageCount').textContent = targetCount;
