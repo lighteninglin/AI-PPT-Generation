@@ -218,19 +218,25 @@ def download_pptx(task_id: str):
                 str(path), filename=path.name,
                 media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             )
-    # fallback: 从项目目录的 exports/ 中找最新的 pptx
+    # fallback: 从项目目录中搜索 pptx (exports/ + backup/ + 根目录)
     try:
         project_dir = _get_project_dir(task_id)
     except HTTPException:
         raise HTTPException(404, "PPTX 尚未生成完成或任务不存在")
+    all_pptx = []
     exports_dir = project_dir / "exports"
     if exports_dir.exists():
-        pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda f: f.stat().st_mtime, reverse=True)
-        if pptx_files:
-            return FileResponse(
-                str(pptx_files[0]), filename=pptx_files[0].name,
-                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            )
+        all_pptx.extend(exports_dir.glob("*.pptx"))
+    backup_dir = project_dir / "backup"
+    if backup_dir.exists():
+        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx.extend(project_dir.glob("*.pptx"))
+    all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
+    if all_pptx:
+        return FileResponse(
+            str(all_pptx[0]), filename=all_pptx[0].name,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
     raise HTTPException(404, "PPTX 文件未找到")
 
 
