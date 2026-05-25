@@ -484,10 +484,43 @@ def get_slide(task_id: str, name: str):
             disk_annotations = []
 
     if root is None:
-        return {"name": safe_name, "content": content, "annotations": []}
+        # 方案A成功，仍需合并标注
+        # 1) 从SVG文本中提取 data-edit-annotation 属性（save-all写入的disk标注）
+        disk_annotations = []
+        for m in re.finditer(
+            r'<(\w+)\s[^>]*id="(_edit_\d+)"[^>]*>',
+            content,
+        ):
+            eid = m.group(2)
+            # 在同一个标签中找 data-edit-annotation
+            tag_text = m.group(0)
+            ann_match = re.search(r'data-edit-annotation="([^"]*)"', tag_text)
+            if ann_match:
+                disk_annotations.append({
+                    "element_id": eid,
+                    "tag": m.group(1),
+                    "annotation": ann_match.group(1),
+                })
+        # 2) 合并内存中的标注（覆盖disk标注）
+        mem_store = _annotation_store.get(task_id, {}).get(safe_name, {})
+        merged = {}
+        for ann in disk_annotations:
+            merged[ann["element_id"]] = ann["annotation"]
+        merged.update(mem_store)
+
+        annotations_list = []
+        for eid, ann in merged.items():
+            tag_match = re.search(rf'<(\w+)\s[^>]*id="{re.escape(eid)}"', content)
+            tag = tag_match.group(1) if tag_match else "unknown"
+            annotations_list.append({
+                "element_id": eid,
+                "tag": tag,
+                "annotation": ann,
+            })
+        return {"name": safe_name, "content": content, "annotations": annotations_list}
 
     # 合并内存中的标注
-    mem_store = _annotation_store.get(task_id, {}).get(name, {})
+    mem_store = _annotation_store.get(task_id, {}).get(safe_name, {})
     merged = {}
     for ann in disk_annotations:
         merged[ann["element_id"]] = ann["annotation"]
@@ -516,14 +549,14 @@ _annotation_store: dict[str, dict[str, dict[str, str]]] = {}
 @app.post("/api/preview/{task_id}/slide/{name}/annotate")
 def annotate_element(task_id: str, name: str, payload: dict):
     """添加/更新标注"""
-    _safe_svg_name(name)
+    safe_name = _safe_svg_name(name)
     element_id = payload.get("element_id", "")
     annotation = payload.get("annotation", "")
     if not element_id or not annotation:
         raise HTTPException(400, "Missing element_id or annotation")
 
     store = _annotation_store.setdefault(task_id, {})
-    file_store = store.setdefault(name, {})
+    file_store = store.setdefault(safe_name, {})
     file_store[element_id] = annotation
     return {"status": "ok", "annotations_count": len(file_store)}
 
@@ -531,9 +564,9 @@ def annotate_element(task_id: str, name: str, payload: dict):
 @app.delete("/api/preview/{task_id}/slide/{name}/annotate/{element_id}")
 def delete_annotation(task_id: str, name: str, element_id: str):
     """删除标注"""
-    _safe_svg_name(name)
+    safe_name = _safe_svg_name(name)
     store = _annotation_store.get(task_id, {})
-    file_store = store.setdefault(name, {})
+    file_store = store.setdefault(safe_name, {})
     file_store.pop(element_id, None)
     return {"status": "ok", "annotations_count": len(file_store)}
 
@@ -615,17 +648,42 @@ async def save_slide(task_id: str, payload: SVGEditPayload):
     target.write_text(payload.content, encoding="utf-8")
     logger.info("SVG 已保存: %s", target)
 
-    # 重新导出 PPTX
+    # 重新导出 PPTX (native优先, 失败fallback到legacy)
     from .ppt_engine import SCRIPTS_DIR
-    cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
-    await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
+    import sys
 
-    # 更新任务的 result_path 指向最新 PPTX
+    export_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
+    result = await asyncio.to_thread(
+        subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
+    )
+    if result.returncode != 0:
+        err_msg = result.stderr
+        fallback_keywords = ["unsupported visual SVG element", "SvgNativeConversionError", "ParseError"]
+        if any(kw in err_msg for kw in fallback_keywords):
+            logger.warning("save: native失败, fallback到legacy: %s", err_msg[:200])
+            legacy_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir), "--only", "legacy"]
+            result2 = await asyncio.to_thread(
+                subprocess.run, legacy_cmd, capture_output=True, text=True, timeout=120
+            )
+            if result2.returncode != 0:
+                raise HTTPException(500, f"svg_to_pptx legacy也失败: {result2.stderr[:500]}")
+        else:
+            raise HTTPException(500, f"svg_to_pptx 失败: {err_msg[:500]}")
+
+    # 搜索PPTX文件
+    all_pptx = []
     exports_dir = project_dir / "exports"
-    pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if pptx_files:
+    if exports_dir.exists():
+        all_pptx.extend(exports_dir.glob("*.pptx"))
+    backup_dir = project_dir / "backup"
+    if backup_dir.exists():
+        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx.extend(project_dir.glob("*.pptx"))
+    all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
+
+    if all_pptx:
         task = tasks.get(task_id, {})
-        task["result_path"] = str(pptx_files[0])
+        task["result_path"] = str(all_pptx[0])
 
     return {"ok": True, "saved": safe_name}
 
@@ -636,9 +694,10 @@ async def rebuild_pptx(task_id: str):
     project_dir = _get_project_dir(task_id)
 
     from .ppt_engine import SCRIPTS_DIR
+    import sys
 
     # Step 1: finalize_svg
-    finalize_cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "finalize_svg.py"), str(project_dir)]
+    finalize_cmd = [sys.executable, str(SCRIPTS_DIR / "finalize_svg.py"), str(project_dir)]
     result = await asyncio.to_thread(
         subprocess.run, finalize_cmd, capture_output=True, text=True
     )
@@ -646,21 +705,44 @@ async def rebuild_pptx(task_id: str):
         logger.error("finalize_svg 失败: %s", result.stderr)
         raise HTTPException(500, f"finalize_svg 失败: {result.stderr[:500]}")
 
-    # Step 2: svg_to_pptx
-    export_cmd = ["/usr/bin/env", "python3", str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
+    # Step 2: svg_to_pptx (native模式, 失败自动fallback到legacy)
+    export_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
     result = await asyncio.to_thread(
-        subprocess.run, export_cmd, capture_output=True, text=True
+        subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
     )
     if result.returncode != 0:
-        logger.error("svg_to_pptx 失败: %s", result.stderr)
-        raise HTTPException(500, f"svg_to_pptx 失败: {result.stderr[:500]}")
+        err_msg = result.stderr
+        # native模式失败 → fallback到legacy模式
+        fallback_keywords = [
+            "unsupported visual SVG element",
+            "SvgNativeConversionError",
+            "ParseError",
+        ]
+        if any(kw in err_msg for kw in fallback_keywords):
+            logger.warning("rebuild native失败, fallback到legacy: %s", err_msg[:200])
+            legacy_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir), "--only", "legacy"]
+            result2 = await asyncio.to_thread(
+                subprocess.run, legacy_cmd, capture_output=True, text=True, timeout=120
+            )
+            if result2.returncode != 0:
+                raise HTTPException(500, f"svg_to_pptx legacy也失败: {result2.stderr[:500]}")
+        else:
+            raise HTTPException(500, f"svg_to_pptx 失败: {err_msg[:500]}")
 
-    # 更新任务 result_path
+    # 搜索PPTX文件（exports/ + backup/ + 根目录）
+    all_pptx = []
     exports_dir = project_dir / "exports"
-    pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if pptx_files:
+    if exports_dir.exists():
+        all_pptx.extend(exports_dir.glob("*.pptx"))
+    backup_dir = project_dir / "backup"
+    if backup_dir.exists():
+        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx.extend(project_dir.glob("*.pptx"))
+    all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
+
+    if all_pptx:
         task = tasks.get(task_id, {})
-        task["result_path"] = str(pptx_files[0])
+        task["result_path"] = str(all_pptx[0])
 
     return {"ok": True, "message": "PPTX 重新导出完成"}
 

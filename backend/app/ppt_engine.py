@@ -306,6 +306,9 @@ class PPTEngine:
             # 如果已经有前导 NN_ 则跳过
             if not re.match(r'^\d{2}_', fname_no_ext):
                 fname = f"{i+1:02d}_{fname_no_ext}.svg"
+            # ── SVG 修复 (弱模型常见错误) ──
+            svg_content = self._fix_svg(svg_content)
+
             # ── XML 校验: 确保保存的 SVG 是合法 XML ──
             try:
                 ET.fromstring(svg_content)
@@ -932,6 +935,81 @@ class PPTEngine:
             enable_thinking=enable_thinking,
         )
         return self._extract_svg(resp)
+
+    # ══════════════════════════════════════════════════════════
+    #  SVG 修复 (弱模型常见错误)
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _fix_svg(svg: str) -> str:
+        """修复弱模型生成的常见 SVG 格式错误。
+
+        已知问题:
+        - id 属性值含空格 (XML 不允许)  → id="edit 1" → id="edit_1"
+        - 属性值缺少引号              → xmlns=http://... → xmlns="http://..."
+        - circle 用了 x/y 而非 cx/cy → 修正属性名
+        - rect 用了 x2/y2 而非 width/height → 移除非法属性
+        - font-family 值溢出引号      → "SimSun" serif → "SimSun, serif"
+        - <g> 标签未闭合              → 补全 </g>
+        - <use> 元素                   → 移除 (svg_to_pptx 不支持)
+        - <animate*> 元素              → 移除
+        """
+        # 1. 移除 animate / animateTransform / animateMotion / use
+        svg = re.sub(r'<animate(?:Transform|Motion)?\b[^>]*/>', '', svg, flags=re.DOTALL)
+        svg = re.sub(r'<animate(?:Transform|Motion)?\b[^>]*>.*?</animate(?:Transform|Motion)?>', '', svg, flags=re.DOTALL)
+        svg = re.sub(r'<use\b[^>]*/>', '', svg, flags=re.DOTALL)
+        svg = re.sub(r'<use\b[^>]*>.*?</use>', '', svg, flags=re.DOTALL)
+
+        # 2. 修复 id 属性中的空格: id="edit 1" → id="edit_1"
+        def _fix_id(m):
+            val = m.group(1)
+            if ' ' in val:
+                return f'id="{val.replace(" ", "_")}"'
+            return m.group(0)
+        svg = re.sub(r'id="([^"]*)"', _fix_id, svg)
+
+        # 3. 修复属性值缺少引号: xmlns=http://... → xmlns="http://..."
+        # 匹配 属性名=非引号值 (后面跟空格或>)
+        svg = re.sub(
+            r'(\b\w+)=([^"\s>]+)([\s>])',
+            lambda m: f'{m.group(1)}="{m.group(2)}"{m.group(3)}',
+            svg,
+        )
+
+        # 4. circle 的 x/y 属性修正为 cx/cy
+        svg = re.sub(r'<circle\b([^>]*)\bx=', lambda m: m.group(0).replace('x=', 'cx='), svg)
+        svg = re.sub(r'<circle\b([^>]*)\by=', lambda m: m.group(0).replace('y=', 'cy='), svg)
+
+        # 5. 移除 rect 的非法 x2/y2 属性
+        svg = re.sub(r'(<rect\b[^>]*?)\s+x2="[^"]*"', r'\1', svg)
+        svg = re.sub(r'(<rect\b[^>]*?)\s+y2="[^"]*"', r'\1', svg)
+
+        # 6. 修复 font-family 值溢出引号
+        # "Microsoft YaHei, SimSun" serif → "Microsoft YaHei, SimSun, serif"
+        def _fix_font_family(m):
+            prefix = m.group(1)
+            quoted = m.group(2)
+            trailing = m.group(3)
+            if trailing.strip():
+                # 把引号外的部分追加到引号内
+                inner = quoted.rstrip('"')
+                return f'{prefix}{inner} {trailing.strip()}"'
+            return m.group(0)
+        svg = re.sub(
+            r'(font-family=")([^"]*")(\s+[^<]*?)(?=[\s/])',
+            _fix_font_family,
+            svg,
+        )
+
+        # 7. 补全未闭合的 <g> 标签
+        open_g = len(re.findall(r'<g\b[^>]*/?>', svg)) - len(re.findall(r'<g\b[^>]*/>', svg))  # 排除自闭合
+        open_g = len(re.findall(r'<g\b[^>]*>(?!.*?/>)', svg))
+        close_g = len(re.findall(r'</g>', svg))
+        if open_g > close_g:
+            # 在 </svg> 前补全缺失的 </g>
+            svg = svg.replace('</svg>', '</g>' * (open_g - close_g) + '\n</svg>')
+
+        return svg
 
     # ══════════════════════════════════════════════════════════
     #  Notes
