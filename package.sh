@@ -56,6 +56,10 @@ tar -czf "$FINAL" -C "$DIST_DIR" \
     .env.example
 
 SIZE=$(du -sh "$FINAL" | cut -f1)
+
+# 清理中间产物（docker save 的原始 tar，1-2GB）
+rm -f "$DIST_DIR/${IMAGE_NAME}.tar"
+
 echo ""
 echo "═══════════════════════════════════════════"
 echo "  ✅ 打包完成!"

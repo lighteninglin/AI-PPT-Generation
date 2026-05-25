@@ -390,14 +390,26 @@ class PPTEngine:
         _prog("step7", "导出完成!", 95)
 
         # 找到生成的 pptx
+        # native模式输出到 exports/, legacy模式输出到 backup/
+        # 所以在 project_path 下递归搜索所有 pptx 文件
         exports_dir = project_path / "exports"
+        all_pptx = []
         if exports_dir.exists():
-            pptx_files = sorted(exports_dir.glob("*.pptx"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if pptx_files:
-                _prog("done", "PPT生成完成!", 100)
-                return pptx_files[0]
+            all_pptx.extend(exports_dir.glob("*.pptx"))
+        # 也搜索 backup/ 目录 (legacy模式输出)
+        backup_dir = project_path / "backup"
+        if backup_dir.exists():
+            all_pptx.extend(backup_dir.rglob("*.pptx"))
+        # 还搜索项目根目录 (某些模式直接输出到根目录)
+        all_pptx.extend(project_path.glob("*.pptx"))
 
-        raise RuntimeError("PPTX 导出失败: 未找到输出文件")
+        # 按修改时间排序，取最新的
+        all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
+        if all_pptx:
+            _prog("done", "PPT生成完成!", 100)
+            return all_pptx[0]
+
+        raise RuntimeError(f"PPTX 导出失败: 未找到输出文件 (搜索路径: {project_path})")
 
     def generate(
         self,
@@ -898,6 +910,7 @@ class PPTEngine:
             f"## 禁止事项(会导致生成失败)\n"
             f"- 禁止使用 <animate>, <animateTransform>, <animateMotion> 元素\n"
             f"- 禁止使用 <foreignObject> 元素\n"
+            f"- 禁止使用 <use> 元素（svg_to_pptx不支持）\n"
             f"- 禁止中英文混用: 源内容是中文则所有文字必须是中文\n"
             f"- 禁止自行添加英文翻译或英文注释\n"
             f"- 禁止让图表/图形超出 viewBox 范围, 所有坐标和尺寸必须控制在 0~{W}(宽) 和 0~{H}(高) 之间\n"
