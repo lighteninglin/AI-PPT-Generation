@@ -57,9 +57,6 @@ tar -czf "$FINAL" -C "$DIST_DIR" \
 
 SIZE=$(du -sh "$FINAL" | cut -f1)
 
-# 清理中间产物（docker save 的原始 tar，1-2GB）
-rm -f "$DIST_DIR/${IMAGE_NAME}.tar"
-
 echo ""
 echo "═══════════════════════════════════════════"
 echo "  ✅ 打包完成!"
@@ -99,6 +96,9 @@ chmod +x "$DEPLOY_DIR/manage.sh"
 # 加载最新镜像
 echo "  📦 加载镜像..."
 docker load -q -i "$DIST_DIR/${IMAGE_NAME}.tar"
+
+# 清理中间产物（docker save 的原始 tar，1-2GB，已加载完毕不再需要）
+rm -f "$DIST_DIR/${IMAGE_NAME}.tar"
 
 # 启动
 echo "  🚀 启动容器 (端口: ${HOST_PORT})..."
