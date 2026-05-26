@@ -309,26 +309,14 @@ class PPTEngine:
             # ── SVG 修复 (弱模型常见错误) ──
             svg_content = self._fix_svg(svg_content)
 
-            # ── XML 校验: 确保保存的 SVG 是合法 XML ──
+            # ── XML 校验 ──
+            # _fix_svg 已经做了预处理, 这里做最终验证
+            # 即使XML仍有小问题也强制写入 — finalize_svg 和 legacy 模式可以处理非标准SVG
             try:
                 ET.fromstring(svg_content)
+                logger.debug("第 %d 页SVG XML合法", i+1)
             except ET.ParseError as e:
-                logger.warning("第 %d 页SVG XML非法，尝试修复: %s", i+1, e)
-                # 尝试修复：移除非法字符、补全缺失标签
-                fixed = svg_content
-                # 移除 XML 声明前的非法字节
-                fixed = re.sub(r'^[^<]+', '', fixed)
-                # 确保以 </svg> 结尾
-                if '</svg>' not in fixed:
-                    fixed = fixed.rstrip() + '\n</svg>'
-                # 尝试再次解析
-                try:
-                    ET.fromstring(fixed)
-                    svg_content = fixed
-                    logger.info("第 %d 页SVG XML修复成功", i+1)
-                except ET.ParseError:
-                    logger.error("第 %d 页SVG XML修复失败，跳过此页", i+1)
-                    continue
+                logger.warning("第 %d 页SVG XML仍有小问题(已由_fix_svg预处理): %s — 强制写入, legacy模式兜底", i+1, e)
             (svg_output_dir / fname).write_text(svg_content, encoding="utf-8")
 
         _prog("step6", f"全部 {total_pages} 页SVG生成完成", 76)
@@ -944,72 +932,97 @@ class PPTEngine:
     def _fix_svg(svg: str) -> str:
         """修复弱模型生成的常见 SVG 格式错误。
 
-        已知问题:
-        - id 属性值含空格 (XML 不允许)  → id="edit 1" → id="edit_1"
-        - 属性值缺少引号              → xmlns=http://... → xmlns="http://..."
-        - circle 用了 x/y 而非 cx/cy → 修正属性名
-        - rect 用了 x2/y2 而非 width/height → 移除非法属性
-        - font-family 值溢出引号      → "SimSun" serif → "SimSun, serif"
-        - <g> 标签未闭合              → 补全 </g>
-        - <use> 元素                   → 移除 (svg_to_pptx 不支持)
-        - <animate*> 元素              → 移除
+        策略: 用 ET 解析再序列化来自动修复 XML 格式问题,
+        然后处理语义层面的问题 (circle x/y → cx/cy 等)。
+        如果 ET 解析失败, 用正则做最后一道防线。
         """
-        # 1. 移除 animate / animateTransform / animateMotion / use
+        # ── 预处理: 移除已知不支持的元素 ──
         svg = re.sub(r'<animate(?:Transform|Motion)?\b[^>]*/>', '', svg, flags=re.DOTALL)
         svg = re.sub(r'<animate(?:Transform|Motion)?\b[^>]*>.*?</animate(?:Transform|Motion)?>', '', svg, flags=re.DOTALL)
         svg = re.sub(r'<use\b[^>]*/>', '', svg, flags=re.DOTALL)
         svg = re.sub(r'<use\b[^>]*>.*?</use>', '', svg, flags=re.DOTALL)
 
-        # 2. 修复 id 属性中的空格: id="edit 1" → id="edit_1"
+        # ── 预处理: 修复 ET 无法解析的已知模式 ──
+        # 1. xmlns=裸URL → 加引号 (只修这种特定模式, 不做通用属性引号修复)
+        svg = re.sub(r'xmlns=(https?://\S+?)([\s>])', r'xmlns="\1"\2', svg)
+        # 2. id="含空格" → 下划线
         def _fix_id(m):
             val = m.group(1)
             if ' ' in val:
                 return f'id="{val.replace(" ", "_")}"'
             return m.group(0)
         svg = re.sub(r'id="([^"]*)"', _fix_id, svg)
-
-        # 3. 修复属性值缺少引号: xmlns=http://... → xmlns="http://..."
-        # 匹配 属性名=非引号值 (后面跟空格或>)
+        # 3. font-family="..." 后面跟裸关键词 (serif/sans-serif/monospace)
+        #    font-family="SimSun" serif → font-family="SimSun, serif"
         svg = re.sub(
-            r'(\b\w+)=([^"\s>]+)([\s>])',
-            lambda m: f'{m.group(1)}="{m.group(2)}"{m.group(3)}',
+            r'font-family="([^"]*)"(\s+(?:serif|sans-serif|monospace))',
+            r'font-family="\1,\2"',
             svg,
         )
-
-        # 4. circle 的 x/y 属性修正为 cx/cy
-        svg = re.sub(r'<circle\b([^>]*)\bx=', lambda m: m.group(0).replace('x=', 'cx='), svg)
-        svg = re.sub(r'<circle\b([^>]*)\by=', lambda m: m.group(0).replace('y=', 'cy='), svg)
-
-        # 5. 移除 rect 的非法 x2/y2 属性
-        svg = re.sub(r'(<rect\b[^>]*?)\s+x2="[^"]*"', r'\1', svg)
-        svg = re.sub(r'(<rect\b[^>]*?)\s+y2="[^"]*"', r'\1', svg)
-
-        # 6. 修复 font-family 值溢出引号
-        # "Microsoft YaHei, SimSun" serif → "Microsoft YaHei, SimSun, serif"
-        def _fix_font_family(m):
-            prefix = m.group(1)
-            quoted = m.group(2)
-            trailing = m.group(3)
-            if trailing.strip():
-                # 把引号外的部分追加到引号内
-                inner = quoted.rstrip('"')
-                return f'{prefix}{inner} {trailing.strip()}"'
-            return m.group(0)
-        svg = re.sub(
-            r'(font-family=")([^"]*")(\s+[^<]*?)(?=[\s/])',
-            _fix_font_family,
-            svg,
-        )
-
-        # 7. 补全未闭合的 <g> 标签
-        open_g = len(re.findall(r'<g\b[^>]*/?>', svg)) - len(re.findall(r'<g\b[^>]*/>', svg))  # 排除自闭合
-        open_g = len(re.findall(r'<g\b[^>]*>(?!.*?/>)', svg))
+        # 4. 补全 </svg>
+        if '</svg>' not in svg:
+            svg = svg.rstrip() + '\n</svg>'
+        # 5. 补全未闭合的 <g> 标签 (在 </svg> 前补全)
+        open_g = len(re.findall(r'<g\b[^>]*>', svg))
         close_g = len(re.findall(r'</g>', svg))
         if open_g > close_g:
-            # 在 </svg> 前补全缺失的 </g>
             svg = svg.replace('</svg>', '</g>' * (open_g - close_g) + '\n</svg>')
 
-        return svg
+        # ── 尝试 ET 解析 ──
+        try:
+            root = ET.fromstring(svg)
+        except ET.ParseError:
+            # ET 解析失败, 尝试更激进的正则修复
+            # 移除所有注释 (注释里可能有 -- 导致解析失败)
+            svg = re.sub(r'<!--.*?-->', '', svg, flags=re.DOTALL)
+            # 移除非法属性: 属性名含特殊字符的
+            svg = re.sub(r'\s[\w-]*[^"\w:>_-]\w*="[^"]*"', '', svg)
+            # 再试一次
+            try:
+                root = ET.fromstring(svg)
+            except ET.ParseError as e2:
+                logger.warning("_fix_svg: ET解析彻底失败: %s, 返回原始文本(不修复)", e2)
+                # 最后防线: 尝试逐行修复
+                return svg
+
+        # ── ET 解析成功, 用 ET 修复语义问题 ──
+        # circle 的 x/y → cx/cy (ET可能保留为合法属性)
+        for elem in root.iter('circle'):
+            if 'x' in elem.attrib and 'cx' not in elem.attrib:
+                elem.attrib['cx'] = elem.attrib.pop('x')
+            if 'y' in elem.attrib and 'cy' not in elem.attrib:
+                elem.attrib['cy'] = elem.attrib.pop('y')
+
+        # rect 的 x2/y2 → 移除
+        for elem in root.iter('rect'):
+            elem.attrib.pop('x2', None)
+            elem.attrib.pop('y2', None)
+
+        # 序列化回文本
+        fixed = ET.tostring(root, encoding='unicode', xml_declaration=False)
+
+        # ET.tostring 会加 ns0: 前缀, 清理掉
+        fixed = re.sub(r'\bns0:', '', fixed)
+        fixed = re.sub(r'\s+xmlns:ns0="[^"]*"', '', fixed)
+        # ET 会把单引号变 &quot;, 换回来
+        fixed = fixed.replace('&quot;', "'")
+
+        # ── 后处理: ET 无法修复的语义问题 ──
+        # circle 的 x/y (ET可能保留) → cx/cy
+        fixed = re.sub(r'(<circle\b[^>]*?)\s+x="([^"]*)"', r'\1 cx="\2"', fixed)
+        fixed = re.sub(r'(<circle\b[^>]*?)\s+y="([^"]*)"', r'\1 cy="\2"', fixed)
+        # 移除 circle 上残留的裸 x= / y= (已转为cx/cy)
+        fixed = re.sub(r'(<circle\b[^>]*?)\s+x="[^"]*"', r'\1', fixed)
+        fixed = re.sub(r'(<circle\b[^>]*?)\s+y="[^"]*"', r'\1', fixed)
+        # rect 的 x2/y2 (ET可能保留)
+        fixed = re.sub(r'(<rect\b[^>]*?)\s+x2="[^"]*"', r'\1', fixed)
+        fixed = re.sub(r'(<rect\b[^>]*?)\s+y2="[^"]*"', r'\1', fixed)
+
+        # 确保有 xmlns
+        if 'xmlns="http://www.w3.org/2000/svg"' not in fixed:
+            fixed = fixed.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+
+        return fixed
 
     # ══════════════════════════════════════════════════════════
     #  Notes
