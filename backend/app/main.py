@@ -24,6 +24,9 @@ from pydantic import BaseModel
 from .config import ConfigManager, LLMConfig
 from .ppt_engine import PPTEngine, PROJECTS_DIR
 
+import time
+from datetime import datetime, timedelta
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,7 @@ def _save_task_meta(task_id: str, task: dict):
                 "topic": task.get("topic", ""),
                 "result_path": task.get("result_path"),
                 "project_path": project_path,
+                "last_active": datetime.now().isoformat(),
             }
             (Path(project_path) / "task_meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False), encoding="utf-8"
@@ -97,10 +101,125 @@ def _restore_tasks():
     if restored:
         logger.info("从磁盘恢复了 %d 个任务", restored)
 
+# ── 过期任务清理（7天） ──
+CLEANUP_DAYS = 7
+
+def _touch_task_meta(project_dir: Path):
+    """更新 task_meta.json 的 last_active 时间"""
+    meta_path = project_dir / "task_meta.json"
+    if not meta_path.exists():
+        return
+    try:
+        raw = meta_path.read_text(encoding="utf-8")
+        meta = json.loads(raw)
+        meta["last_active"] = datetime.now().isoformat()
+        tmp = meta_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(meta_path)  # 原子替换，防半写
+    except json.JSONDecodeError:
+        logger.warning("_touch_task_meta: %s JSON损坏，跳过", meta_path)
+    except OSError as e:
+        logger.warning("_touch_task_meta: 写入失败 %s: %s", meta_path, e)
+
+def _is_task_project(d: Path) -> bool:
+    """判断目录是否为PPT项目（避免误删非任务目录）"""
+    if (d / "task_meta.json").exists():
+        return True
+    # 无meta但包含svg_output/或exports/，视为项目目录
+    if (d / "svg_output").is_dir() or (d / "exports").is_dir():
+        return True
+    return False
+
+def _parse_last_active(meta: dict, fallback_dir: Path) -> Optional[datetime]:
+    """安全解析last_active时间"""
+    last_str = meta.get("last_active", "")
+    if last_str:
+        try:
+            return datetime.fromisoformat(last_str)
+        except (ValueError, TypeError):
+            pass
+    # 兼容旧任务：用目录修改时间
+    try:
+        return datetime.fromtimestamp(fallback_dir.stat().st_mtime)
+    except OSError:
+        return None
+
+def _cleanup_expired_tasks():
+    """清理超过7天未活跃的任务及其文件"""
+    now = datetime.now()
+    cutoff = now - timedelta(days=CLEANUP_DAYS)
+    removed = 0
+    skipped_running = 0
+    errors = 0
+    if not PROJECTS_DIR.exists():
+        return 0
+    import shutil
+    dirs = list(PROJECTS_DIR.iterdir())
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        if not _is_task_project(d):
+            continue
+        meta_path = d / "task_meta.json"
+        if not meta_path.exists():
+            # 无meta的项目目录，用目录修改时间判断
+            try:
+                mtime = datetime.fromtimestamp(d.stat().st_mtime)
+                if mtime < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed += 1
+                    logger.info("清理无meta过期目录: %s (mtime=%s)", d.name, mtime.isoformat())
+            except OSError:
+                pass
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # 跳过正在运行的任务（防止误清理）
+            status = meta.get("status", "")
+            if status in ("running", "pending"):
+                skipped_running += 1
+                continue
+            last_active = _parse_last_active(meta, d)
+            if last_active is None:
+                logger.warning("清理: %s 无法解析时间，跳过", d.name)
+                continue
+            if last_active < cutoff:
+                task_id = meta.get("task_id", d.name)
+                tasks.pop(task_id, None)
+                try:
+                    shutil.rmtree(d)
+                except OSError as e:
+                    logger.error("清理失败（磁盘/权限?）: %s: %s", d.name, e)
+                    errors += 1
+                    continue
+                removed += 1
+                logger.info("清理过期任务: %s (last_active=%s)", d.name,
+                            meta.get("last_active", "目录mtime"))
+        except json.JSONDecodeError:
+            logger.warning("清理: %s meta JSON损坏，跳过", d.name)
+            errors += 1
+        except Exception as e:
+            logger.warning("清理检查失败 %s: %s", d.name, e)
+            errors += 1
+    if removed or errors:
+        logger.info("清理完成: 删除%d个, 跳过运行中%d个, 失败%d个", removed, skipped_running, errors)
+    return removed
+
 @app.on_event("startup")
 def _on_startup():
     _restore_tasks()
+    _cleanup_expired_tasks()
     logger.info("启动完成, 内存中 %d 个任务", len(tasks))
+
+    # 每小时执行一次清理（带异常保护，防止协程崩溃）
+    async def _periodic_cleanup():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                _cleanup_expired_tasks()
+            except Exception as e:
+                logger.error("定时清理异常（不影响后续执行）: %s", e)
+    asyncio.get_event_loop().create_task(_periodic_cleanup())
 
 
 # ── 数据模型 ──
@@ -770,8 +889,10 @@ def save_all_annotations(task_id: str):
         tree.write(str(svg_file), encoding="UTF-8", xml_declaration=True)
         modified.append(filename)
 
-    # 清空已保存的标注
+    # 清空已保存的标注 & 续期
     _annotation_store.pop(task_id, None)
+    if modified:
+        _touch_task_meta(project_dir)
     return {"status": "ok", "files_modified": modified}
 
 
@@ -847,6 +968,13 @@ async def apply_annotations_api(task_id: str):
 
     # 清除已应用的标注
     _annotation_store.pop(task_id, None)
+
+    # 续期：批注操作视为活跃，重置7天倒计时
+    try:
+        project_dir = _get_project_dir(task_id)
+        _touch_task_meta(project_dir)
+    except Exception:
+        pass
 
     return result
 

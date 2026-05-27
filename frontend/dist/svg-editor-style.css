@@ -527,6 +527,7 @@ html, body {
     inset: 0;
     background: rgba(0, 0, 0, 0.65);
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
     z-index: 1000;

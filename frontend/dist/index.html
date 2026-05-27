@@ -180,6 +180,15 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
       <h2 style="margin-top:12px;color:var(--ok)">PPT 生成完成!</h2>
       <a class="btn btn-primary download-btn" id="downloadBtn" href="#">📥 下载 PPTX 文件</a><br>
       <a class="preview-link" id="previewLink" href="#" target="_blank">🔍 在线预览 SVG</a>
+      <div id="bookmarkHint" style="margin-top:18px;padding:14px 18px;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:10px;text-align:left;font-size:.88em;display:none">
+        <div style="font-weight:600;margin-bottom:6px">📌 收藏预览链接，随时查看本次任务</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <code id="previewUrl" style="flex:1;padding:6px 10px;background:var(--bg);border-radius:6px;overflow-x:auto;white-space:nowrap;font-size:.85em;word-break:break-all"></code>
+          <button class="btn btn-secondary" style="padding:6px 14px;font-size:.85em;white-space:nowrap" onclick="copyPreviewLink(this)">📋 复制链接</button>
+        </div>
+        <div style="margin-top:8px;color:var(--dim);font-size:.85em">💡 任务保留7天，在预览页添加批注可自动续期</div>
+      </div>
+      <button class="btn btn-secondary" style="margin-top:16px" onclick="resetAll()">生成新的PPT</button>
     </div>
   </div>
 </div>
@@ -613,7 +622,16 @@ async function confirmAndExecute() {
 function onExecuteDone(task) {
   document.getElementById('downloadBtn').href='/api/download/'+task.id;
   document.getElementById('previewLink').href='/api/preview/'+task.id;
+  var previewFullUrl=location.origin+'/api/preview/'+task.id;
+  document.getElementById('previewUrl').textContent=previewFullUrl;
+  document.getElementById('bookmarkHint').style.display='block';
   showPhase('done');
+}
+
+function copyPreviewLink(btn) {
+  var url=document.getElementById('previewUrl').textContent;
+  if(navigator.clipboard){navigator.clipboard.writeText(url).then(function(){btn.textContent='✅ 已复制';setTimeout(function(){btn.textContent='📋 复制链接'},2000)});}
+  else{var ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);btn.textContent='✅ 已复制';setTimeout(function(){btn.textContent='📋 复制链接'},2000);}
 }
 
 function onError(task) { showError(task.message); }

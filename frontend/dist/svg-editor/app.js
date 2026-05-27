@@ -889,7 +889,7 @@
             modalOverlay.style.display = "block";
             modalConfirm.style.display = "none";
             modalCancel.style.display = "none";
-            modalMessage.textContent = "正在保存标注并应用AI修改...";
+            modalMessage.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;gap:14px"><div class="modal-spinner"></div><span>正在保存标注并应用AI修改...</span></div>';
 
             fetch(API + "/save-all", { method: "POST" })
                 .then(function (res) { return res.json(); })
@@ -900,14 +900,14 @@
                         return;
                     }
                     // Step 2: apply annotations via AI
-                    modalMessage.textContent = "标注已保存，正在调用AI修改...";
+                    modalMessage.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;gap:14px"><div class="modal-spinner"></div><span>标注已保存，正在调用AI修改...</span></div>';
                     return fetch(API + "/apply-annotations", { method: "POST" })
                         .then(function (res) { return res.json(); })
                         .then(function (applyData) {
                             if (applyData.errors && applyData.errors.length > 0) {
-                                modalMessage.textContent = "AI修改完成，部分出错: " + applyData.errors.join("; ");
+                                modalMessage.innerHTML = '<div style="text-align:center">⚠️ AI修改完成，部分出错<br><small style="color:#a0a0b8">' + applyData.errors.join("; ") + '</small></div>';
                             } else {
-                                modalMessage.textContent = "AI修改完成！已修改 " + (applyData.modified || []).length + " 页。";
+                                modalMessage.innerHTML = '<div style="text-align:center">✅ AI修改完成！已修改 ' + (applyData.modified || []).length + ' 页</div>';
                             }
                             // Refresh current slide
                             if (currentSlide) selectSlide(currentSlide);
@@ -915,7 +915,7 @@
                         });
                 })
                 .catch(function (err) {
-                    modalMessage.textContent = "操作失败: " + err.message;
+                    modalMessage.innerHTML = '<div style="text-align:center">❌ 操作失败<br><small style="color:#e06060">' + err.message + '</small></div>';
                     setTimeout(function () { modalOverlay.style.display = "none"; }, 3000);
                 });
         });
