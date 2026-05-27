@@ -286,6 +286,65 @@ def convert_g(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
 
 _NON_VISUAL_TAGS = frozenset(('defs', 'title', 'desc', 'metadata', 'style'))
 
+# HTML inline tags that LLMs sometimes emit inside <text>.
+# Maps tag → SVG tspan style addition.
+_HTML_INLINE_MAP = {
+    'strong': 'font-weight:bold',
+    'b':      'font-weight:bold',
+    'em':     'font-style:italic',
+    'i':      'font-style:italic',
+}
+
+
+def _flatten_html_inline(root: ET.Element) -> int:
+    """Replace HTML inline elements (<strong>, <b>, <em>, <i>) inside <text>
+    with equivalent <tspan> elements carrying font-weight/font-style.
+
+    Returns the number of replacements made.
+    """
+    count = 0
+
+    def _walk(elem: ET.Element) -> None:
+        nonlocal count
+        # Recurse first so children are already clean.
+        for child in list(elem):
+            _walk(child)
+
+        tag = _local_tag(elem)
+        if tag not in _HTML_INLINE_MAP:
+            return
+
+        parent = _parent_map.get(elem) if _parent_map else None
+        # Fallback: find parent by scanning root (ET has no parent ref).
+        if parent is None:
+            return
+
+        # Build a replacement <tspan> with inherited style + inline style.
+        extra_style = _HTML_INLINE_MAP[tag]
+        existing_style = (elem.get('style') or '').rstrip(';')
+        new_style = (existing_style + ';' + extra_style) if existing_style else extra_style
+
+        tspan = ET.Element(f'{{{SVG_NS}}}tspan')
+        # Copy attributes (except tag-specific ones).
+        for k, v in elem.attrib.items():
+            tspan.set(k, v)
+        tspan.set('style', new_style)
+
+        # Move children of the HTML element into the tspan.
+        for child in list(elem):
+            tspan.append(child)
+
+        # Replace the HTML element in the parent.
+        idx = list(parent).index(elem)
+        parent.remove(elem)
+        parent.insert(idx, tspan)
+        count += 1
+
+    # Build a parent map so we can navigate upward.
+    _parent_map = {c: p for p in root.iter() for c in p}
+    _walk(root)
+    return count
+
 
 def _supports_matrix_transform(elem: ET.Element) -> bool:
     """Return whether this subtree can consume a full affine matrix directly."""
@@ -432,6 +491,11 @@ def convert_svg_to_slide_shapes(
     from .tspan_flattener import flatten_positional_tspans
     if flatten_positional_tspans(tree) and verbose:
         print('  Flattened positional <tspan> into independent <text>')
+
+    # Flatten HTML inline elements (<strong>, <b>, <em>, <i>) inside <text>
+    # into <tspan> with font-weight/font-style.  LLMs sometimes emit these
+    # non-SVG tags; they cause SvgNativeConversionError if left as-is.
+    _flatten_html_inline(root)
 
     unsupported = _collect_unsupported_visuals(root)
     if unsupported:

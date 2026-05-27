@@ -304,10 +304,28 @@ function renderConfirmations(cf) {
   ]);
 
   // 4. 风格目标 — Layer1模式选择 + Layer2自由描述
+  // 解析 style_objective: 支持 "B) General Consulting — 数据清晰优先" / "B) General Consulting - 数据清晰优先" / 纯文字
+  const _so = cf.style_objective || '';
+  const _soModeMatch = _so.match(/^[A-C]\)\s*[\w\s]+/);
+  const _soSep = _so.includes('—') ? '—' : _so.includes('–') ? '–' : _so.includes(' - ') ? ' - ' : null;
+  let _soMode = '', _soStyle = '';
+  if (_soModeMatch) {
+    _soMode = _soModeMatch[0].trim();
+    if (_soSep) {
+      _soStyle = _so.split(_soSep).slice(1).join(_soSep).trim();
+    }
+  } else if (_soSep) {
+    // 无A/B/C前缀但有分隔符: 第一段当模式, 后面当风格
+    _soMode = _so.split(_soSep)[0].trim();
+    _soStyle = _so.split(_soSep).slice(1).join(_soSep).trim();
+  } else {
+    // 无法解析: 整个值放到风格描述
+    _soStyle = _so;
+  }
   addCard(c, 4, '风格目标', [
-    {label:'沟通模式', key:'style_objective.mode', type:'combobox', value: (cf.style_objective||'').match(/^[A-C]\)/)?cf.style_objective.split('—')[0].trim():'', placeholder:'选择沟通模式',
+    {label:'沟通模式', key:'style_objective.mode', type:'combobox', value: _soMode, placeholder:'选择沟通模式',
      options:['A) General Versatile — 视觉冲击优先','B) General Consulting — 数据清晰优先','C) Top Consulting — 逻辑说服优先']},
-    {label:'视觉风格描述', key:'style_objective.style', type:'combobox', value: (cf.style_objective||'').includes('—')?cf.style_objective.split('—').slice(1).join('—').trim():cf.style_objective||'', placeholder:'描述期望的视觉风格',
+    {label:'视觉风格描述', key:'style_objective.style', type:'combobox', value: _soStyle, placeholder:'描述期望的视觉风格',
      options:['neo-Chinese (新中式)','corporate-photo (商务摄影)','flat (扁平化)','editorial (编辑排版)','vivid-launch (炫酷发布会)','digital-dashboard (数据面板)','sketch-notes (手绘笔记)','vector-illustration (矢量插画)','screen-print (丝网印刷)','ink-notes (水墨笔记)','warm-earth (暖色调大地系)','cool-corporate (冷色调商务系)']}
   ]);
 

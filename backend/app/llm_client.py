@@ -47,10 +47,16 @@ class LLMClient:
             base_url=config.base_url,
         )
         self.model = config.model_name
+        # 弱模型标记: 来自配置 or 自动检测
+        self.is_weak = config.is_weak
+        # 上下文长度限制 (0=不限)
+        self.max_context = config.max_context
         logger.info(
-            "LLM 客户端初始化完成: base_url=%s, model=%s",
+            "LLM 客户端初始化完成: base_url=%s, model=%s, is_weak=%s, max_context=%s",
             config.base_url,
             config.model_name,
+            self.is_weak,
+            self.max_context or "auto",
         )
 
     def chat(
@@ -58,6 +64,7 @@ class LLMClient:
         messages: list[dict[str, str]],
         system_prompt: Optional[str] = None,
         enable_thinking: bool = False,
+        max_output: int = 16384,
     ) -> str:
         """调用 LLM 进行对话
 
@@ -65,6 +72,7 @@ class LLMClient:
             messages: 消息列表，格式为 [{"role": "user", "content": "..."}]
             system_prompt: 可选的系统提示词
             enable_thinking: 是否启用思考模式
+            max_output: 最大输出tokens上限 (不同场景不同: SVG单页=16384, Strategist=32768)
 
         Returns:
             模型回复的文本内容
@@ -73,20 +81,21 @@ class LLMClient:
             RuntimeError: 重试次数用尽后仍失败
         """
         full_messages = self._build_messages(messages, system_prompt)
-        return self._call_with_retry(full_messages, enable_thinking=enable_thinking)
+        return self._call_with_retry(full_messages, enable_thinking=enable_thinking, max_output=max_output)
 
     def chat_json(
         self,
         messages: list[dict[str, str]],
         system_prompt: Optional[str] = None,
         enable_thinking: bool = False,
+        max_output: int = 16384,
     ) -> Any:
         """调用 LLM 并解析 JSON 响应"""
         system_suffix = "\n\n请以纯 JSON 格式回复，不要包含 markdown 代码块标记。"
         effective_system = (system_prompt or "") + system_suffix
 
         full_messages = self._build_messages(messages, effective_system)
-        response_text = self._call_with_retry(full_messages, enable_thinking=enable_thinking)
+        response_text = self._call_with_retry(full_messages, enable_thinking=enable_thinking, max_output=max_output)
 
         return self._extract_json(response_text)
 
@@ -102,10 +111,45 @@ class LLMClient:
         result.extend(messages)
         return result
 
+    def _estimate_tokens(self, messages: list[dict[str, str]]) -> int:
+        """粗略估算消息的token数（中文约1.5字/token，英文约4字符/token）"""
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        # 保守估计: 中文为主时约1.5字符/token
+        return int(total_chars / 1.5) + 200  # +200 for message overhead
+
+    def _calc_max_tokens(self, messages: list[dict[str, str]], max_output: int = 16384) -> Optional[int]:
+        """根据上下文长度计算 max_tokens
+
+        如果设置了 max_context, 则:
+          max_tokens = max_context - input_tokens - safety_margin
+        否则返回 None (由API自行决定)
+
+        Args:
+            messages: 消息列表
+            max_output: 调用方期望的最大输出tokens上限
+        """
+        if not self.max_context:
+            return None
+
+        input_tokens = self._estimate_tokens(messages)
+        safety_margin = 500  # 留出安全余量
+        available = self.max_context - input_tokens - safety_margin
+
+        if available <= 0:
+            logger.warning(
+                "输入已超过上下文限制! input≈%d, max_context=%d, 强制max_tokens=1024",
+                input_tokens, self.max_context,
+            )
+            return 1024
+
+        # 下限1024, 上限由调用方决定(不同场景输出量不同)
+        return max(1024, min(available, max_output))
+
     def _call_with_retry(
         self,
         messages: list[dict[str, str]],
         enable_thinking: bool = False,
+        max_output: int = 16384,
     ) -> str:
         """带重试机制的 API 调用"""
         last_error: Optional[Exception] = None
@@ -119,17 +163,26 @@ class LLMClient:
                     MAX_RETRIES,
                     len(messages),
                 )
-                response = self.client.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=messages,  # type: ignore
                     temperature=0.7,
                     stream=False,
                     extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
                 )
+                max_tokens = self._calc_max_tokens(messages, max_output=max_output)
+                if max_tokens:
+                    kwargs["max_tokens"] = max_tokens
+                    logger.debug("max_context=%d, max_tokens=%d", self.max_context, max_tokens)
+                response = self.client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content
                 if content is None:
                     raise RuntimeError("模型返回了空响应")
-                logger.debug("API 调用成功，响应长度: %d 字符", len(content))
+                # 记录max_tokens限制是否生效
+                finish_reason = response.choices[0].finish_reason
+                logger.info("API 调用成功，响应长度: %d 字符, finish_reason: %s, max_tokens限制: %s",
+                           len(content), finish_reason,
+                           kwargs.get("max_tokens", "auto"))
                 return content.strip()
 
             except RateLimitError as e:

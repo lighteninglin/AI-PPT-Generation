@@ -354,7 +354,7 @@ class PPTEngine:
         _prog("step7", "导出PPTX...", 90)
         try:
             _run_script(
-                [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path)],
+                [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_path), "--native"],
                 timeout=120,
             )
         except RuntimeError as e:
@@ -1141,3 +1141,210 @@ def _make_progress(progress: Optional[Callable] = None) -> Callable:
         if progress:
             progress(stage, msg, pct)
     return _prog
+
+
+# ══════════════════════════════════════════════════════════
+#  应用标注 — 复用ppt-master的annotations模块精准修改SVG
+# ══════════════════════════════════════════════════════════
+
+def _apply_annotation_to_element(elem, annotation: str) -> bool:
+    """尝试精准修改。返回True表示已处理，False交给LLM。"""
+    import re as _re
+    ann = annotation.strip()
+
+    # ── 位置调整 ──
+    move_patterns = [
+        (r'(?:往下|向下|下移|移下)\s*(\d+)\s*(?:像素|px)?', 0, 1),
+        (r'(?:往上|向上|上移|移上)\s*(\d+)\s*(?:像素|px)?', 0, -1),
+        (r'(?:往右|向右|右移|移右)\s*(\d+)\s*(?:像素|px)?', 1, 0),
+        (r'(?:往左|向左|左移|移左)\s*(\d+)\s*(?:像素|px)?', -1, 0),
+    ]
+    for pat, dx_sign, dy_sign in move_patterns:
+        m = _re.search(pat, ann)
+        if m:
+            delta = int(m.group(1))
+            _move_element(elem, dx_sign * delta, dy_sign * delta)
+            return True
+
+    return False
+
+
+def _move_element(elem, dx: int, dy: int):
+    """移动元素：修改transform或x/y属性"""
+    import re as _re
+    transform = elem.get('transform', '')
+    if transform:
+        m = _re.search(r'translate\(\s*([-\d.]+)\s*[,\s]\s*([-\d.]+)\s*\)', transform)
+        if m:
+            new_x = float(m.group(1)) + dx
+            new_y = float(m.group(2)) + dy
+            new_t = transform[:m.start()] + f'translate({new_x:.1f},{new_y:.1f})' + transform[m.end():]
+            elem.set('transform', new_t)
+            return
+    if dx != 0 and elem.get('x') is not None:
+        try: elem.set('x', str(float(elem.get('x')) + dx))
+        except ValueError: pass
+    if dy != 0 and elem.get('y') is not None:
+        try: elem.set('y', str(float(elem.get('y')) + dy))
+        except ValueError: pass
+
+
+def _scale_font(elem, factor: float):
+    import re as _re
+    for child in (list(elem.iter()) if 'g' in elem.tag else [elem]):
+        fs = child.get('font-size', '')
+        m = _re.match(r'([\d.]+)(px)?', fs)
+        if m:
+            new_size = float(m.group(1)) * factor
+            child.set('font-size', f'{new_size:.1f}{m.group(2) or "px"}')
+
+
+def apply_annotations(
+    engine,
+    project_path: str,
+    annotations_data: dict,
+    progress=None,
+) -> dict:
+    """
+    应用标注 — 与ppt-master一致：
+    1. check_annotations 列出所有标注
+    2. 把完整SVG + 标注清单发给LLM，LLM直接返回修改后的SVG
+    3. 清除标注属性 → finalize → 导出PPTX
+    """
+    import xml.etree.ElementTree as _ET
+    import re as _re
+    from .annotations import assign_temp_ids, parse_annotations
+
+    proj_dir = Path(project_path)
+    svg_dir = _svg_dir_for(proj_dir)
+    modified_files = []
+    errors = []
+
+    logger.info("apply_annotations: project=%s, svg_dir=%s, annotations_data=%s",
+                proj_dir.name, svg_dir, {k: len(v) for k, v in annotations_data.items()} if annotations_data else "EMPTY")
+
+    def _prog(stage, msg, pct):
+        if progress:
+            try: progress(stage, msg, pct)
+            except Exception: pass
+
+    _prog("apply_annotations", "开始应用标注", 0)
+
+    for filename, file_anns in annotations_data.items():
+        svg_path = svg_dir / filename
+        if not svg_path.exists():
+            errors.append(f"{filename}: 文件不存在")
+            continue
+
+        _prog("apply_annotations", f"处理 {filename}", 20)
+        svg_text = svg_path.read_text(encoding='utf-8')
+
+        # 用check_annotations.py同样的逻辑发现标注
+        try:
+            tree = _ET.parse(str(svg_path))
+            root = tree.getroot()
+        except _ET.ParseError as e:
+            errors.append(f"{filename}: SVG解析失败 - {e}")
+            continue
+
+        assign_temp_ids(root)
+        disk_anns = parse_annotations(root)
+        disk_map = {a['element_id']: a['annotation'] for a in disk_anns}
+
+        # 合并磁盘标注和前端传来的标注
+        all_anns = {}
+        all_anns.update(disk_map)
+        all_anns.update(file_anns)
+        if not all_anns:
+            logger.info("apply_annotations: %s 无标注", filename)
+            continue
+
+        logger.info("apply_annotations: %s 找到 %d 个标注: %s", filename, len(all_anns), list(all_anns.keys()))
+
+        # ── 与ppt-master一致：把完整SVG + 标注清单发给LLM ──
+        if not engine or not engine.llm:
+            errors.append(f"{filename}: LLM不可用，无法处理标注")
+            continue
+
+        _prog("apply_annotations", f"LLM修改 {filename}", 40)
+
+        # 构建标注清单（与check_annotations.py输出格式一致）
+        ann_list = ""
+        for eid, ann_text in all_anns.items():
+            ann_list += f"  - 元素 id=\"{eid}\": {ann_text}\n"
+
+        prompt = (
+            f"修改这个SVG文件中标注的元素。\n\n"
+            f"标注清单:\n{ann_list}\n"
+            f"规则:\n"
+            f"1. 只修改上面列出的元素，其他元素保持原样不变\n"
+            f"2. 根据标注文本的含义修改对应元素\n"
+            f"3. 颜色必须使用十六进制格式（如 #FF0000），不要使用CSS颜色名（如red/blue）\n"
+            f"4. 保持SVG的xmlns、viewBox、width、height等属性完全不变\n"
+            f"5. 保持所有未标注元素的结构、属性完全不变\n"
+            f"6. 修改后删除元素的 data-edit-target 和 data-edit-annotation 属性\n"
+            f"7. 输出完整的SVG文件，从<svg>到</svg>，不要省略任何部分\n\n"
+            f"SVG内容:\n{svg_text}"
+        )
+
+        try:
+            resp = engine.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="你是SVG编辑专家。根据用户标注修改SVG元素。只输出修改后的完整SVG。",
+                max_output=32768,
+            )
+            # 提取SVG内容
+            new_svg = engine._extract_svg(resp) or resp
+            logger.info("apply_annotations: %s LLM返回 %d 字符, _extract_svg得到 %d 字符, 前100: %s",
+                        filename, len(resp), len(new_svg), new_svg[:100])
+            if not new_svg.strip().startswith('<svg'):
+                # LLM可能返回了不带xml声明的SVG，尝试补全
+                new_svg = _re.sub(r'<\?xml[^?]*\?>', '', new_svg).strip()
+            if not new_svg.strip().startswith('<svg'):
+                errors.append(f"{filename}: LLM返回的不是有效SVG")
+                continue
+
+            # 验证新SVG能被ET解析
+            try:
+                _ET.fromstring(new_svg)
+            except _ET.ParseError as e:
+                errors.append(f"{filename}: LLM返回的SVG解析失败 - {e}")
+                continue
+
+            # 写回
+            svg_path.write_text(new_svg, encoding='utf-8')
+            # 也写svg_final
+            svg_final = proj_dir / 'svg_final' / filename
+            if svg_final.exists():
+                svg_final.write_text(new_svg, encoding='utf-8')
+
+            logger.info("apply_annotations: %s — LLM修改完成 (%d 标注)", filename, len(all_anns))
+            modified_files.append(filename)
+
+        except Exception as e:
+            errors.append(f"{filename}: LLM修改失败 - {e}")
+            logger.error("apply_annotations LLM失败: %s", e)
+
+    # 重新导出PPTX
+    if modified_files:
+        _prog("apply_annotations", "重新导出PPTX", 80)
+        try:
+            _run_script([sys.executable, str(SKILL_DIR / 'scripts' / 'finalize_svg.py'), str(proj_dir)], timeout=60)
+            _run_script([sys.executable, str(SKILL_DIR / 'scripts' / 'svg_to_pptx.py'), str(proj_dir), "--native"], timeout=60)
+            _prog("apply_annotations", "导出完成", 100)
+        except Exception as e:
+            errors.append(f"PPTX导出失败: {e}")
+            logger.error("apply_annotations PPTX导出失败: %s", e)
+
+    return {"modified": modified_files, "errors": errors}
+
+
+def _svg_dir_for(project_dir: Path) -> Path:
+    """确定SVG文件目录: 优先svg_output, 回退svg_final"""
+    svg_output = project_dir / "svg_output"
+    svg_final = project_dir / "svg_final"
+    if svg_output.exists() and any(svg_output.glob("*.svg")):
+        return svg_output
+    if svg_final.exists() and any(svg_final.glob("*.svg")):
+        return svg_final
+    return svg_output

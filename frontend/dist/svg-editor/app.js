@@ -5,7 +5,11 @@
 (function () {
     "use strict";
 
-    var API_BASE = window.__API_BASE__ || "/api";
+    // ---- API base (ppt-web: task_id from URL path) ----
+    var _pathParts = window.location.pathname.split("/");
+    var _taskIdx = _pathParts.indexOf("editor");
+    var TASK_ID = (_taskIdx >= 0 && _pathParts[_taskIdx + 1]) ? _pathParts[_taskIdx + 1] : "";
+    var API = TASK_ID ? "/api/preview/" + TASK_ID : "";
 
     // ---- i18n -------------------------------------------------------
     var MESSAGES = {
@@ -39,8 +43,7 @@
             err_remove_annotation: "Failed to remove annotation: ",
             err_save: "Save failed: ",
             modal_confirm_submit: "Submit annotations to disk?\n\nThe preview service will keep running. Click Exit preview when you want to stop it.",
-            modal_success_submit: "标注已保存。\n\n点击下方按钮让AI根据标注修改页面。",
-            btn_apply_annotations: "🤖 应用标注 (AI修改)",
+            modal_success_submit: "Annotations saved.\n\nReturn to the chat and tell the AI to apply them (e.g. \"apply my annotations\"). The preview service is still running.",
             modal_confirm_exit: "Exit preview and stop the local server?\n\nUnsaved annotations will be discarded.",
             modal_success_exit: "Preview stopped.\n\nYou can close this tab and return to the chat.",
             modal_stopping: "Stopping preview server...",
@@ -82,8 +85,7 @@
             err_remove_annotation: "删除标注失败:",
             err_save: "保存失败:",
             modal_confirm_submit: "确认将标注保存到磁盘?\n\n预览服务会继续运行。需要关闭时请点击退出预览。",
-            modal_success_submit: "标注已保存。\n\n点击下方按钮让AI根据标注修改页面。",
-            btn_apply_annotations: "🤖 应用标注 (AI修改)",
+            modal_success_submit: "标注已保存。\n\n请回到对话窗口并告诉 AI 应用这些标注(例如\"应用我的标注\")。预览服务仍在运行。",
             modal_confirm_exit: "退出预览并停止本地服务?\n\n未保存的标注将被丢弃。",
             modal_success_exit: "预览已停止。\n\n可以关闭本标签页并回到对话窗口。",
             modal_stopping: "正在停止预览服务……",
@@ -223,7 +225,7 @@
     //  1.  loadSlides  -- GET /api/slides
     // ================================================================
     function loadSlides() {
-        return fetch(API_BASE + "/slides?t=" + Date.now())
+        return fetch(API + "/slides")
             .then(function (res) { return res.json(); })
             .then(function (data) {
                 slideListEl.innerHTML = "";
@@ -303,7 +305,7 @@
         cancelRubberBand();
         clearSelection();
 
-        fetch(API_BASE + "/slide/" + encodeURIComponent(name) + "?t=" + Date.now())
+        fetch(API + "/slide/" + encodeURIComponent(name))
             .then(function (res) { return res.json(); })
             .then(function (data) {
                 if (data.error) {
@@ -320,13 +322,6 @@
                 svgPlaceholder.style.display = "none";
                 svgContent.style.display = "block";
                 svgContent.innerHTML = sanitizeSvg(data.content);
-
-                // 强制SVG宽高为100%, 让viewBox+CSS控制缩放, 不受固定像素值限制
-                var svgEl = svgContent.querySelector("svg");
-                if (svgEl) {
-                    svgEl.setAttribute("width", "100%");
-                    svgEl.setAttribute("height", "100%");
-                }
 
                 // Build annotations map from response
                 (data.annotations || []).forEach(function (a) {
@@ -688,7 +683,7 @@
 
         var ids = Array.from(selectedElementIds);
         var promises = ids.map(function (eid) {
-            return fetch(API_BASE + "/slide/" + encodeURIComponent(currentSlide) + "/annotate", {
+            return fetch(API + "/slide/" + encodeURIComponent(currentSlide) + "/annotate", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ element_id: eid, annotation: text })
@@ -717,7 +712,7 @@
     function removeAnnotation(elementId) {
         if (!currentSlide) return;
 
-        fetch(API_BASE + "/slide/" + encodeURIComponent(currentSlide) + "/annotate/" + encodeURIComponent(elementId), {
+        fetch(API + "/slide/" + encodeURIComponent(currentSlide) + "/annotate/" + encodeURIComponent(elementId), {
             method: "DELETE"
         })
             .then(function (res) { return res.json(); })
@@ -832,7 +827,7 @@
             modalConfirm.style.display = "none";
             modalCancel.style.display = "none";
             modalMessage.textContent = t("modal_stopping");
-            fetch(API_BASE + "/shutdown", {
+            fetch(API + "/shutdown", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ reason: "exit-preview" })
@@ -846,66 +841,85 @@
             return;
         }
 
-        // Step 2: save annotations. Service lifetime is controlled only by Exit preview.
+        // 提交标注 = save-all + apply-annotations（ppt-web中直接触发AI修改）
         modalConfirm.style.display = "none";
         modalCancel.style.display = "none";
+        modalMessage.textContent = "正在保存标注并应用AI修改...";
 
-        fetch(API_BASE + "/save-all", { method: "POST" })
+        fetch(API + "/save-all", { method: "POST" })
             .then(function (res) { return res.json(); })
-            .then(function (data) {
-                if (data.error) {
-                    modalMessage.textContent = t("err_save") + data.error;
-                } else {
-                    // 标注已保存 — 显示"应用标注"按钮让用户触发LLM修改
-                    modalMessage.textContent = t("modal_success_submit");
-                    // 新增应用标注按钮
-                    var applyBtn = document.createElement("button");
-                    applyBtn.textContent = t("btn_apply_annotations") || "🤖 应用标注 (AI修改)";
-                    applyBtn.style.cssText = "margin-top:12px;padding:10px 24px;background:#22c55e;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:1em;font-weight:600;display:block;width:100%;";
-                    applyBtn.addEventListener("click", function () {
-                        applyBtn.disabled = true;
-                        applyBtn.textContent = "⏳ 正在应用标注...";
-                        modalMessage.textContent = t("msg_applying") || "正在调用AI根据标注修改页面...";
-                        fetch(API_BASE + "/apply-annotations", { method: "POST" })
-                            .then(function (res) { return res.json(); })
-                            .then(function (result) {
-                                if (result.modified && result.modified.length > 0) {
-                                    modalMessage.textContent = "✅ " + t("msg_apply_success") || "✅ 标注已应用! 修改了 " + result.modified.length + " 个页面";
-                                    applyBtn.style.display = "none";
-                                    // 刷新当前幻灯片
-                                    var _slideToReload = currentSlide;
-                                    loadSlides().then(function() {
-                                        if (_slideToReload) selectSlide(_slideToReload);
-                                    });
-                                } else {
-                                    var errMsg = (result.errors && result.errors.length > 0)
-                                        ? result.errors.join("; ")
-                                        : "未知错误";
-                                    modalMessage.textContent = "❌ 应用失败: " + errMsg;
-                                    applyBtn.disabled = false;
-                                    applyBtn.textContent = t("btn_apply_annotations") || "🤖 应用标注 (AI修改)";
-                                }
-                            })
-                            .catch(function (err) {
-                                modalMessage.textContent = "❌ 网络错误: " + err;
-                                applyBtn.disabled = false;
-                                applyBtn.textContent = t("btn_apply_annotations") || "🤖 应用标注 (AI修改)";
-                            });
-                    });
-                    // 插入按钮到modal overlay中
-                    var modalContent = modalOverlay.querySelector(".modal-content") || modalOverlay;
-                    // 移除旧的应用按钮(如果有)
-                    var oldBtn = modalContent.querySelector(".apply-btn");
-                    if (oldBtn) oldBtn.remove();
-                    applyBtn.className = "apply-btn";
-                    modalContent.appendChild(applyBtn);
-                    loadSlides();
+            .then(function (saveData) {
+                if (saveData.error) {
+                    modalMessage.textContent = "保存失败: " + saveData.error;
+                    setTimeout(function () { modalOverlay.style.display = "none"; }, 2000);
+                    return;
                 }
+                // 检查是否有标注需要AI处理
+                var annCount = document.querySelectorAll(".annotation-item").length;
+                if (annCount === 0) {
+                    modalMessage.textContent = "标注已保存（无标注需要AI处理）";
+                    loadSlides();
+                    setTimeout(function () { modalOverlay.style.display = "none"; }, 1500);
+                    return;
+                }
+                modalMessage.textContent = "标注已保存，正在调用AI修改...";
+                return fetch(API + "/apply-annotations", { method: "POST" })
+                    .then(function (res) { return res.json(); })
+                    .then(function (applyData) {
+                        if (applyData.errors && applyData.errors.length > 0) {
+                            modalMessage.textContent = "AI修改完成，部分出错: " + applyData.errors.join("; ");
+                        } else {
+                            modalMessage.textContent = "AI修改完成！已修改 " + (applyData.modified || []).length + " 页。";
+                        }
+                        loadSlides();
+                        setTimeout(function () { modalOverlay.style.display = "none"; }, 2000);
+                    });
             })
             .catch(function (err) {
-                modalMessage.textContent = t("err_save") + err;
+                modalMessage.textContent = "操作失败: " + err.message;
+                setTimeout(function () { modalOverlay.style.display = "none"; }, 3000);
             });
     });
+
+    // ---- Apply AI modifications button ----
+    var btnApply = document.getElementById("btn-apply");
+    if (btnApply) {
+        btnApply.addEventListener("click", function () {
+            // Step 1: save annotations to disk first
+            modalOverlay.style.display = "block";
+            modalConfirm.style.display = "none";
+            modalCancel.style.display = "none";
+            modalMessage.textContent = "正在保存标注并应用AI修改...";
+
+            fetch(API + "/save-all", { method: "POST" })
+                .then(function (res) { return res.json(); })
+                .then(function (saveData) {
+                    if (saveData.error) {
+                        modalMessage.textContent = "保存失败: " + saveData.error;
+                        setTimeout(function () { modalOverlay.style.display = "none"; }, 2000);
+                        return;
+                    }
+                    // Step 2: apply annotations via AI
+                    modalMessage.textContent = "标注已保存，正在调用AI修改...";
+                    return fetch(API + "/apply-annotations", { method: "POST" })
+                        .then(function (res) { return res.json(); })
+                        .then(function (applyData) {
+                            if (applyData.errors && applyData.errors.length > 0) {
+                                modalMessage.textContent = "AI修改完成，部分出错: " + applyData.errors.join("; ");
+                            } else {
+                                modalMessage.textContent = "AI修改完成！已修改 " + (applyData.modified || []).length + " 页。";
+                            }
+                            // Refresh current slide
+                            if (currentSlide) selectSlide(currentSlide);
+                            setTimeout(function () { modalOverlay.style.display = "none"; }, 2000);
+                        });
+                })
+                .catch(function (err) {
+                    modalMessage.textContent = "操作失败: " + err.message;
+                    setTimeout(function () { modalOverlay.style.display = "none"; }, 3000);
+                });
+        });
+    }
 
     modalCancel.addEventListener("click", function () {
         modalConfirm.textContent = t("modal_submit");
@@ -924,27 +938,20 @@
     //  Utility
     // ================================================================
     function sanitizeSvg(svgString) {
-        // 直接清理SVG字符串, 不经过DOMParser+XMLSerializer
-        // DOMParser XML模式+XMLSerializer可能在序列化时添加xmlns等属性,
-        // 导致innerHTML渲染时出现黑屏问题
-        // HTML5解析器对SVG很宽容, 直接innerHTML更可靠
-        var cleaned = svgString;
-        // 1. 移除 <script> 标签 (防XSS)
-        cleaned = cleaned.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script\s*>/gi, "");
-        cleaned = cleaned.replace(/<script\b[^>]*\/>/gi, "");
-        // 2. 移除 foreignObject
-        cleaned = cleaned.replace(/<foreignObject\b[^<]*(?:(?!<\/foreignObject>)<[^<]*)*<\/foreignObject\s*>/gi, "");
-        cleaned = cleaned.replace(/<foreignObject\b[^>]*\/>/gi, "");
-        // 3. 移除事件属性 (onclick等)
-        cleaned = cleaned.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-        // 4. 移除危险URI (javascript:, data:)
-        cleaned = cleaned.replace(/(\s+(?:href|xlink:href)\s*=\s*(?:"[^"]*"|'[^']*'))/gi, function(m) {
-            var val = m.match(/=\s*(?:"([^"]*)"|'([^']*)')/);
-            var v = val ? (val[1] || val[2] || "") : "";
-            if (/^\s*javascript\s*:/i.test(v) || /^\s*data\s*:/i.test(v)) return "";
-            return m;
+        var doc = new DOMParser().parseFromString(svgString, "image/svg+xml");
+        doc.querySelectorAll("script,foreignObject").forEach(function (el) { el.remove(); });
+        doc.querySelectorAll("*").forEach(function (el) {
+            Array.from(el.attributes).forEach(function (attr) {
+                if (attr.name.indexOf("on") === 0) el.removeAttribute(attr.name);
+                // Strip dangerous URI protocols from href/xlink:href
+                if ((attr.name === "href" || attr.name === "xlink:href") &&
+                    (/^\s*javascript\s*:/i.test(attr.value) ||
+                     /^\s*data\s*:/i.test(attr.value))) {
+                    el.removeAttribute(attr.name);
+                }
+            });
         });
-        return cleaned;
+        return new XMLSerializer().serializeToString(doc.documentElement);
     }
 
     function showError(msg) {
@@ -972,7 +979,7 @@
     }
 
     function loadConfig() {
-        return fetch(API_BASE + "/config")
+        return fetch(API + "/config")
             .then(function (res) { return res.json(); })
             .then(function (data) {
                 liveMode = !!data.live;

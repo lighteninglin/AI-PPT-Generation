@@ -31,6 +31,14 @@ class LLMConfig(BaseModel):
         default="gpt-4o",
         description="模型名称",
     )
+    is_weak: bool = Field(
+        default=False,
+        description="弱模型模式(精简提示词+后端修复), 适用于上下文<128K的模型",
+    )
+    max_context: int = Field(
+        default=0,
+        description="模型最大上下文长度(0=自动, 如65536/131072)",
+    )
 
     def is_configured(self) -> bool:
         return bool(self.api_key.strip())
@@ -62,11 +70,21 @@ class ConfigManager:
         env_key = os.environ.get("LLM_API_KEY", "").strip()
         env_url = os.environ.get("LLM_BASE_URL", "").strip()
         env_model = os.environ.get("LLM_MODEL", "").strip()
+        env_is_weak = os.environ.get("LLM_IS_WEAK", "").strip().lower() in ("1", "true", "yes")
+        env_max_context = int(os.environ.get("LLM_MAX_CONTEXT", "0") or "0")
+
+        # 自动检测: 模型名含 flash/mini/small/lite 视为弱模型
+        model_lower = (env_model or file_cfg.get("model_name", "")).lower()
+        auto_weak = any(kw in model_lower for kw in [
+            "flash", "mini", "small", "lite", "8b", "7b", "14b",
+        ])
 
         cfg = LLMConfig(
             api_key=env_key or file_cfg.get("api_key", ""),
             base_url=env_url or file_cfg.get("base_url", "https://api.openai.com/v1"),
             model_name=env_model or file_cfg.get("model_name", "gpt-4o"),
+            is_weak=env_is_weak or file_cfg.get("is_weak", False) or auto_weak,
+            max_context=env_max_context or file_cfg.get("max_context", 0),
         )
 
         # 环境变量存在时，同步更新 config.json（避免显示旧值）
@@ -100,6 +118,8 @@ class ConfigManager:
             "api_key": config.masked_api_key(),
             "base_url": config.base_url,
             "model_name": config.model_name,
+            "is_weak": config.is_weak,
+            "max_context": config.max_context,
             "is_configured": config.is_configured(),
             "configured_via": "env" if ConfigManager.is_env_configured() else "file",
         }

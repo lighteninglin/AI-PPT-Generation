@@ -28,13 +28,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .btn-rebuild{background:var(--accent);color:#fff}
 .btn-download{background:var(--accent2);color:#fff}
 .btn-back{background:var(--border);color:var(--text)}
-#svg-container{flex:1;overflow:auto;display:flex;align-items:center;justify-content:center;padding:16px;background:#1a1a2e}
-#svg-content{max-width:100%;max-height:100%}
-#svg-content svg{max-width:100%;height:auto;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+#svg-container{flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center;padding:16px;background:#1a1a2e}
+#svg-content{display:flex;align-items:center;justify-content:center;width:100%;height:100%}
+#svg-content svg{max-width:100%;max-height:100%;width:auto;height:auto;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
 /* SVG 选中高亮 */
-:global .svg-selectable{cursor:pointer;transition:opacity .15s}
-:global .svg-selectable:hover{opacity:.8;filter:brightness(1.2)}
-:global .svg-selected{outline:2px solid var(--accent);outline-offset:2px;filter:brightness(1.1)}
+.svg-selectable{cursor:pointer;transition:opacity .15s}
+.svg-selectable:hover{opacity:.8;filter:brightness(1.2)}
+.svg-selected{outline:2px solid var(--accent);outline-offset:2px;filter:brightness(1.1)}
 /* 右侧属性面板 */
 .props-panel{width:280px;background:var(--card);border-left:1px solid var(--border);overflow-y:auto;flex:none;padding:12px}
 .props-panel h3{font-size:.85em;color:var(--dim);margin-bottom:8px}
@@ -121,7 +121,7 @@ init();
 // ── 加载幻灯片列表 ──
 async function loadSlides() {
   try {
-    const r = await fetch('/api/preview/' + taskId + '/slides');
+    const r = await fetch('/api/preview/' + taskId + '/slides?t=' + Date.now());
     const d = await r.json();
     slides = d.slides || [];
     const list = document.getElementById('slideList');
@@ -146,13 +146,18 @@ async function selectSlide(name) {
   });
   updateNav();
   try {
-    const r = await fetch('/api/preview/' + taskId + '/slide/' + encodeURIComponent(name));
+    const r = await fetch('/api/preview/' + taskId + '/slide/' + encodeURIComponent(name) + '?t=' + Date.now());
     const d = await r.json();
     if (d.error) { toast(d.error,'err'); return; }
     const container = document.getElementById('svg-content');
     container.innerHTML = d.content;
     svgRoot = container.querySelector('svg');
-    if (svgRoot) setupInteraction();
+    if (svgRoot) {
+      // 强制SVG宽高为100%, 让viewBox+CSS控制缩放, 不受固定像素值限制
+      svgRoot.setAttribute('width', '100%');
+      svgRoot.setAttribute('height', '100%');
+      setupInteraction();
+    }
     clearSelection();
   } catch(e) { toast('加载SVG失败: '+e.message,'err'); }
 }

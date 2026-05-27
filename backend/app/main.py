@@ -36,6 +36,72 @@ FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 tasks: dict[str, dict] = {}
 ws_connections: dict[str, list[WebSocket]] = {}
 
+# ── 任务持久化 ──
+def _save_task_meta(task_id: str, task: dict):
+    """将任务元信息持久化到项目目录，容器重启后可恢复"""
+    try:
+        project_path = None
+        pd = task.get("preview_data") or {}
+        project_path = pd.get("project_path")
+        if not project_path:
+            rp = task.get("result_path")
+            if rp:
+                project_path = str(Path(rp).parent.parent)
+        if project_path and Path(project_path).is_dir():
+            meta = {
+                "task_id": task_id,
+                "status": task.get("status", ""),
+                "topic": task.get("topic", ""),
+                "result_path": task.get("result_path"),
+                "project_path": project_path,
+            }
+            (Path(project_path) / "task_meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+            )
+    except Exception as e:
+        logger.warning("保存task_meta失败: %s", e)
+
+def _restore_tasks():
+    """启动时从 projects/ 目录恢复已完成的任务到内存"""
+    restored = 0
+    for projects_root in [PROJECTS_DIR, Path("/app/projects")]:
+        if not projects_root.is_dir():
+            continue
+        for d in projects_root.iterdir():
+            if not d.is_dir():
+                continue
+            meta_path = d / "task_meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                tid = meta.get("task_id")
+                if not tid or tid in tasks:
+                    continue
+                # 只恢复已完成/错误状态的任务（进行中的无法恢复）
+                status = meta.get("status", "")
+                if status in ("done", "error", "awaiting_confirm"):
+                    tasks[tid] = {
+                        "id": tid,
+                        "status": status,
+                        "progress": 100 if status == "done" else 0,
+                        "stage": "done" if status == "done" else status,
+                        "message": "任务已恢复(重启后)" if status == "done" else "",
+                        "result_path": meta.get("result_path"),
+                        "topic": meta.get("topic", ""),
+                        "preview_data": {"project_path": meta.get("project_path", str(d))},
+                    }
+                    restored += 1
+            except Exception as e:
+                logger.warning("恢复task_meta %s 失败: %s", d.name, e)
+    if restored:
+        logger.info("从磁盘恢复了 %d 个任务", restored)
+
+@app.on_event("startup")
+def _on_startup():
+    _restore_tasks()
+    logger.info("启动完成, 内存中 %d 个任务", len(tasks))
+
 
 # ── 数据模型 ──
 
@@ -209,34 +275,39 @@ def get_task(task_id: str):
 
 @app.get("/api/download/{task_id}")
 def download_pptx(task_id: str):
-    # 优先从内存查找
-    task = tasks.get(task_id)
-    if task and task.get("status") == "done" and task.get("result_path"):
-        path = Path(task["result_path"])
-        if path.exists():
-            return FileResponse(
-                str(path), filename=path.name,
-                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            )
-    # fallback: 从项目目录中搜索 pptx (exports/ + backup/ + 根目录)
     try:
         project_dir = _get_project_dir(task_id)
     except HTTPException:
+        # 最后尝试从内存找
+        task = tasks.get(task_id)
+        if task and task.get("result_path"):
+            path = Path(task["result_path"])
+            if path.exists():
+                return FileResponse(str(path), filename=path.name,
+                    media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
         raise HTTPException(404, "PPTX 尚未生成完成或任务不存在")
-    all_pptx = []
+
+    # 优先从 exports/ 目录按修改时间取最新的（apply后会生成新PPTX）
     exports_dir = project_dir / "exports"
-    if exports_dir.exists():
-        all_pptx.extend(exports_dir.glob("*.pptx"))
-    backup_dir = project_dir / "backup"
-    if backup_dir.exists():
-        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx = list(exports_dir.glob("*.pptx")) if exports_dir.exists() else []
     all_pptx.extend(project_dir.glob("*.pptx"))
     all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
     if all_pptx:
         return FileResponse(
             str(all_pptx[0]), filename=all_pptx[0].name,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
+
+    # fallback: 内存中的result_path
+    task = tasks.get(task_id)
+    if task and task.get("result_path"):
+        path = Path(task["result_path"])
+        if path.exists():
+            return FileResponse(str(path), filename=path.name,
+                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
     raise HTTPException(404, "PPTX 文件未找到")
 
 
@@ -250,10 +321,61 @@ def preview_svg(task_id: str):
         raise HTTPException(500, "SVG编辑器未部署")
     html = html_path.read_text(encoding="utf-8")
     # 注入 API 路径和 task_id
+    api_base = f"/api/preview/{task_id}"
+    # 在 <head> 后注入 __API_BASE__ 全局变量
+    html = html.replace("<head>", f'<head><script>window.__API_BASE__="{api_base}";</script>', 1)
     html = html.replace('id="download-link" href="#"', f'id="download-link" href="/api/download/{task_id}"')
     return HTMLResponse(html)
 
 
+# ── ppt-master SVG 编辑器（复用原始前端） ──
+@app.get("/editor/{task_id}")
+def editor_page(task_id: str):
+    """SVG编辑器页面（复用ppt-master的svg_editor/static/）"""
+    _get_project_dir(task_id)  # 验证项目存在
+    index = FRONTEND_DIST / "svg-editor" / "index.html"
+    if not index.exists():
+        raise HTTPException(500, "SVG编辑器未部署")
+    return FileResponse(str(index), media_type="text/html")
+
+
+@app.get("/editor/{task_id}/style.css")
+def editor_css(task_id: str):
+    css = FRONTEND_DIST / "svg-editor" / "style.css"
+    if css.exists():
+        return FileResponse(str(css), media_type="text/css")
+    raise HTTPException(404)
+
+
+@app.get("/editor/{task_id}/app.js")
+def editor_js(task_id: str):
+    js = FRONTEND_DIST / "svg-editor" / "app.js"
+    if js.exists():
+        return FileResponse(str(js), media_type="application/javascript")
+    raise HTTPException(404)
+
+
+
+# ── 图片/素材路由（SVG中引用的 ../images/* 和 ../assets/*） ──
+@app.get("/editor/{task_id}/images/{filename}")
+def editor_image(task_id: str, filename: str):
+    project_dir = _get_project_dir(task_id)
+    img = project_dir / "images" / filename
+    if img.exists() and img.is_file():
+        return FileResponse(str(img))
+    raise HTTPException(404)
+
+
+@app.get("/editor/{task_id}/assets/{filename}")
+def editor_asset(task_id: str, filename: str):
+    project_dir = _get_project_dir(task_id)
+    asset = project_dir / "assets" / filename
+    if asset.exists() and asset.is_file():
+        return FileResponse(str(asset))
+    raise HTTPException(404)
+
+
+# 兼容旧版SVG编辑器路由
 # SVG编辑器静态文件
 @app.get("/svg-editor-style.css")
 def serve_editor_css():
@@ -375,22 +497,48 @@ def _add_edit_ids_raw(svg_text: str) -> tuple[str, list[dict]]:
 def _get_project_dir(task_id: str) -> Path:
     """从任务字典获取项目目录，失败抛 HTTPException
     
-    支持三种查找方式：
+    支持四种查找方式：
     1. 内存 tasks 字典（容器未重启时有效）
-    2. 精确目录名匹配
-    3. 模糊匹配（task_id 是目录名的子串，如 '623b10' 匹配 '..._623b10_ppt169_...'）
+    2. task_meta.json 映射（重启后恢复的持久化数据）
+    3. 精确目录名匹配
+    4. 模糊匹配（task_id 是目录名的子串，如 '623b10' 匹配 '..._623b10_ppt169_...'）
     """
     task = tasks.get(task_id)
     if task:
-        result_path = task.get("result_path")
-        if result_path:
-            project_dir = Path(result_path).parent.parent
-            if project_dir.exists():
-                return project_dir
+        # 优先用 preview_data.project_path（最可靠）
         preview_data = task.get("preview_data") or {}
         project_path = preview_data.get("project_path")
         if project_path and Path(project_path).exists():
             return Path(project_path)
+        # fallback: result_path 推算（可能不准，如backup子目录）
+        result_path = task.get("result_path")
+        if result_path:
+            rp = Path(result_path)
+            # 从任意深度找到含 task_meta.json 的项目根目录
+            for parent in rp.parents:
+                if (parent / "task_meta.json").exists():
+                    return parent
+            # 最终fallback: .parent.parent（旧逻辑）
+            project_dir = rp.parent.parent
+            if project_dir.exists():
+                return project_dir
+
+    # fallback 0: 扫描 task_meta.json 查找 task_id → project_path 映射
+    for projects_root in [PROJECTS_DIR, PROJECTS_DIR / "projects", Path("/app/projects")]:
+        if not projects_root.is_dir():
+            continue
+        for d in projects_root.iterdir():
+            if not d.is_dir():
+                continue
+            meta_path = d / "task_meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if meta.get("task_id") == task_id:
+                    return d
+            except Exception:
+                pass
 
     # fallback 1: task_id 可能就是项目目录名，在 projects/ 下直接找
     for projects_root in [PROJECTS_DIR, PROJECTS_DIR / "projects", Path("/app/projects")]:
@@ -430,26 +578,39 @@ def _svg_dir_for(project_dir: Path) -> Path:
 
 @app.get("/api/preview/{task_id}/slides")
 def list_slides(task_id: str):
-    """返回项目 SVG 文件列表"""
+    """返回项目 SVG 文件列表（复用ppt-master逻辑：合并disk+内存标注计数）"""
+    from .svg_annotations import parse_annotations
+
     project_dir = _get_project_dir(task_id)
     svg_dir = _svg_dir_for(project_dir)
-    # 自然排序: slide_02 < slide_10 (不是字典序 slide_10 < slide_2)
     import re as _re
     def _natural_key(s):
         return [int(c) if c.isdigit() else c.lower() for c in _re.split(r'(\d+)', s)]
     svgs = sorted((p.name for p in svg_dir.glob("*.svg")), key=_natural_key)
-    # 返回对象数组, 兼容 svg_editor app.js 期望的格式
-    slides = []
+
     ann_store = _annotation_store.get(task_id, {})
+    slides = []
     for name in svgs:
-        file_anns = ann_store.get(name, {})
-        slides.append({"name": name, "annotation_count": len(file_anns)})
+        # disk标注（与ppt-master一致）
+        disk_count = 0
+        try:
+            tree = ET.parse(str(svg_dir / name))
+            disk_count = len(parse_annotations(tree.getroot()))
+        except Exception:
+            pass
+        mem_count = len(ann_store.get(name, {}))
+        annotation_count = max(disk_count, mem_count)
+        slides.append({
+            "name": name,
+            "annotated": annotation_count > 0,
+            "annotation_count": annotation_count,
+        })
     return {"slides": slides, "dir": svg_dir.name}
 
 
 @app.get("/api/preview/{task_id}/slide/{name}")
 def get_slide(task_id: str, name: str):
-    """返回单个 SVG 文件内容 (含标注)"""
+    """返回单个 SVG 文件内容（复用ppt-master逻辑：ET解析+assign_temp_ids+标注合并+icon内联）"""
     from .svg_annotations import assign_temp_ids, parse_annotations
 
     safe_name = _safe_svg_name(name)
@@ -459,83 +620,80 @@ def get_slide(task_id: str, name: str):
     if not svg_path.exists():
         raise HTTPException(404, f"SVG 文件不存在: {safe_name}")
 
-    # 解析SVG并分配临时ID
-    root = None
+    # ── ET解析（与ppt-master一致） ──
     try:
-        # 方案A: 直接读原始文本, 用正则给元素添加 _edit_N id
-        raw_svg = svg_path.read_text(encoding="utf-8")
-        content, disk_annotations = _add_edit_ids_raw(raw_svg)
-    except Exception as e:
-        logger.warning("get_slide 方案A失败: %s → %s, fallback到ET", safe_name, e)
-        try:
-            # 方案B fallback: ET 解析（可能破坏引号风格）
-            tree = ET.parse(str(svg_path))
-            root = tree.getroot()
-            assign_temp_ids(root)
-            disk_annotations = parse_annotations(root)
-            content = ET.tostring(root, encoding="unicode", xml_declaration=False)
-            content = re.sub(r'\bns0:', '', content)
-            content = re.sub(r'\s+xmlns:ns0="[^"]*"', '', content)
-            content = content.replace('&quot;', "'")
-            if 'xmlns="http://www.w3.org/2000/svg"' not in content:
-                content = content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
-        except ET.ParseError:
-            content = svg_path.read_text(encoding="utf-8")
-            disk_annotations = []
+        tree = ET.parse(str(svg_path))
+        root = tree.getroot()
+    except ET.ParseError as e:
+        raise HTTPException(500, f"SVG解析失败: {e}")
 
-    if root is None:
-        # 方案A成功，仍需合并标注
-        # 1) 从SVG文本中提取 data-edit-annotation 属性（save-all写入的disk标注）
-        disk_annotations = []
-        for m in re.finditer(
-            r'<(\w+)\s[^>]*id="(_edit_\d+)"[^>]*>',
-            content,
-        ):
-            eid = m.group(2)
-            # 在同一个标签中找 data-edit-annotation
-            tag_text = m.group(0)
-            ann_match = re.search(r'data-edit-annotation="([^"]*)"', tag_text)
-            if ann_match:
-                disk_annotations.append({
-                    "element_id": eid,
-                    "tag": m.group(1),
-                    "annotation": ann_match.group(1),
-                })
-        # 2) 合并内存中的标注（覆盖disk标注）
-        mem_store = _annotation_store.get(task_id, {}).get(safe_name, {})
-        merged = {}
-        for ann in disk_annotations:
-            merged[ann["element_id"]] = ann["annotation"]
-        merged.update(mem_store)
+    assign_temp_ids(root)
+    disk_annotations = parse_annotations(root)
 
-        annotations_list = []
-        for eid, ann in merged.items():
-            tag_match = re.search(rf'<(\w+)\s[^>]*id="{re.escape(eid)}"', content)
-            tag = tag_match.group(1) if tag_match else "unknown"
-            annotations_list.append({
-                "element_id": eid,
-                "tag": tag,
-                "annotation": ann,
-            })
-        return {"name": safe_name, "content": content, "annotations": annotations_list}
-
-    # 合并内存中的标注
-    mem_store = _annotation_store.get(task_id, {}).get(safe_name, {})
+    # 合并内存中的标注（覆盖disk标注）
+    mem_annotations = _annotation_store.get(task_id, {}).get(safe_name, {})
     merged = {}
     for ann in disk_annotations:
         merged[ann["element_id"]] = ann["annotation"]
-    merged.update(mem_store)
+    merged.update(mem_annotations)
 
+    # 构建标注列表（与ppt-master一致：遍历root.iter找标注元素）
     annotations_list = []
     for elem in root.iter():
         eid = elem.get("id")
         if eid and eid in merged:
-            tag = elem.tag.split("}", 1)[1] if "}" in elem.tag else elem.tag
+            tag = elem.tag
+            if "}" in tag:
+                tag = tag.split("}", 1)[1]
             annotations_list.append({
                 "element_id": eid,
                 "tag": tag,
                 "annotation": merged[eid],
             })
+
+    content = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    # 清理ET产生的命名空间前缀
+    content = re.sub(r'\bns0:', '', content)
+    content = re.sub(r'\s+xmlns:ns0="[^"]*"', '', content)
+    content = content.replace('&quot;', "'")
+    if 'xmlns="http://www.w3.org/2000/svg"' not in content:
+        content = content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+
+    # icon内联（与ppt-master _inline_icons一致）
+    try:
+        from .embed_icons import (
+            parse_use_element, resolve_icon_path,
+            extract_paths_from_icon, generate_icon_group,
+        )
+        _ICONS_DIR = Path(__file__).resolve().parents[2] / "skills" / "ppt-master" / "templates" / "icons"
+        _USE_ICON_PATTERN = re.compile(r'<use\s+[^>]*data-icon="[^"]*"[^>]*/>')
+        matches = list(_USE_ICON_PATTERN.finditer(content))
+        if matches:
+            new_content = content
+            for match in reversed(matches):
+                use_str = match.group(0)
+                try:
+                    attrs = parse_use_element(use_str)
+                    icon_name = attrs.get('icon')
+                    if not icon_name:
+                        continue
+                    icon_path, _ = resolve_icon_path(str(icon_name), str(_ICONS_DIR))
+                    color = str(attrs.get('fill', '#000000'))
+                    elements, style, base_size = extract_paths_from_icon(icon_path, color)
+                    if not elements:
+                        continue
+                    replacement = generate_icon_group(attrs, elements, style, base_size)
+                    id_match = re.search(r'\bid="([^"]+)"', use_str)
+                    if id_match:
+                        replacement = replacement.replace(
+                            '<g ', f'<g id="{id_match.group(1)}" data-icon="{icon_name}" ', 1,
+                        )
+                    new_content = new_content[:match.start()] + replacement + new_content[match.end():]
+                except Exception:
+                    continue
+            content = new_content
+    except ImportError:
+        pass  # embed_icons不可用时跳过
 
     return {"name": safe_name, "content": content, "annotations": annotations_list}
 
@@ -617,6 +775,82 @@ def save_all_annotations(task_id: str):
     return {"status": "ok", "files_modified": modified}
 
 
+@app.post("/api/preview/{task_id}/apply-annotations")
+async def apply_annotations_api(task_id: str):
+    """根据用户标注调用LLM修改SVG, 并重新导出PPTX"""
+    from .ppt_engine import apply_annotations, PPTEngine
+
+    pd = tasks.get(task_id)
+    if not pd:
+        # 尝试从磁盘恢复单个任务
+        _restore_tasks()
+        pd = tasks.get(task_id)
+    if not pd:
+        raise HTTPException(404, "任务不存在")
+
+    # 获取标注: 优先内存中的标注, 然后从磁盘读取
+    annotations_data = _annotation_store.get(task_id, {})
+    if not annotations_data:
+        # 尝试从SVG文件中读取已保存的标注
+        from .svg_annotations import parse_annotations
+        project_dir = _get_project_dir(task_id)
+        svg_dir = _svg_dir_for(project_dir)
+        for svg_file in svg_dir.glob("*.svg"):
+            try:
+                tree = ET.parse(str(svg_file))
+                root = tree.getroot()
+                disk_anns = parse_annotations(root)
+                if disk_anns:
+                    file_anns = {}
+                    for ann in disk_anns:
+                        file_anns[ann["element_id"]] = ann["annotation"]
+                    annotations_data[svg_file.name] = file_anns
+            except Exception:
+                pass
+
+    if not annotations_data:
+        raise HTTPException(400, "没有找到标注, 请先在编辑器中添加标注并提交")
+
+    # 创建engine实例(复用LLM配置)
+    cfg = ConfigManager.load()
+    engine = PPTEngine(cfg)
+
+    project_path = str((pd.get("preview_data") or {}).get("project_path", ""))
+    if not project_path:
+        project_path = str((pd.get("result_path") and str(Path(pd["result_path"]).parent.parent)) or "")
+    if not project_path or not Path(project_path).exists():
+        # 最终fallback: 用_get_project_dir
+        try:
+            project_path = str(_get_project_dir(task_id))
+        except HTTPException:
+            raise HTTPException(500, "项目目录不存在")
+
+    # 通过WebSocket推送进度
+    async def _ws_progress(stage: str, msg: str, pct: int):
+        try:
+            conns = ws_connections.get(task_id, [])
+            for ws in conns:
+                await ws.send_json({"stage": stage, "message": msg, "progress": pct})
+        except Exception:
+            pass
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: apply_annotations(
+            engine, project_path, annotations_data,
+            progress=lambda s, m, p: asyncio.run_coroutine_threadsafe(
+                _ws_progress(s, m, p), loop
+            ).result() if loop.is_running() else None,
+        ),
+    )
+
+    # 清除已应用的标注
+    _annotation_store.pop(task_id, None)
+
+    return result
+
+
 @app.get("/api/preview/{task_id}/config")
 def editor_config(task_id: str):
     """编辑器配置"""
@@ -648,8 +882,8 @@ async def save_slide(task_id: str, payload: SVGEditPayload):
     target.write_text(payload.content, encoding="utf-8")
     logger.info("SVG 已保存: %s", target)
 
-    # 重新导出 PPTX (native优先, 失败fallback到legacy)
-    from .ppt_engine import SCRIPTS_DIR
+    # 重新导出 PPTX (仅native模式)
+    from .ppt_engine import SCRIPTS_DIR, PPTEngine
     import sys
 
     export_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
@@ -657,27 +891,31 @@ async def save_slide(task_id: str, payload: SVGEditPayload):
         subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
     )
     if result.returncode != 0:
+        # native失败 → 修复SVG后重试
         err_msg = result.stderr
-        fallback_keywords = ["unsupported visual SVG element", "SvgNativeConversionError", "ParseError"]
-        if any(kw in err_msg for kw in fallback_keywords):
-            logger.warning("save: native失败, fallback到legacy: %s", err_msg[:200])
-            legacy_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir), "--only", "legacy"]
-            result2 = await asyncio.to_thread(
-                subprocess.run, legacy_cmd, capture_output=True, text=True, timeout=120
-            )
-            if result2.returncode != 0:
-                raise HTTPException(500, f"svg_to_pptx legacy也失败: {result2.stderr[:500]}")
-        else:
-            raise HTTPException(500, f"svg_to_pptx 失败: {err_msg[:500]}")
+        logger.warning("save: native失败, 修复SVG后重试: %s", err_msg[:200])
+        svg_final_dir = project_dir / "svg_final"
+        if svg_final_dir.exists():
+            # _fix_svg不需要LLM调用, 纯正则修复
+            from .ppt_engine import PPTEngine
+            engine = PPTEngine(ConfigManager.load())
+            for svg_file in svg_final_dir.glob("*.svg"):
+                try:
+                    raw = svg_file.read_text(encoding="utf-8")
+                    fixed = engine._fix_svg(raw)
+                    if fixed != raw:
+                        svg_file.write_text(fixed, encoding="utf-8")
+                except Exception:
+                    pass
+        result2 = await asyncio.to_thread(
+            subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
+        )
+        if result2.returncode != 0:
+            raise HTTPException(500, f"svg_to_pptx native重试也失败: {result2.stderr[:500]}")
 
-    # 搜索PPTX文件
-    all_pptx = []
+    # 搜索PPTX文件 (仅native exports/)
     exports_dir = project_dir / "exports"
-    if exports_dir.exists():
-        all_pptx.extend(exports_dir.glob("*.pptx"))
-    backup_dir = project_dir / "backup"
-    if backup_dir.exists():
-        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx = list(exports_dir.glob("*.pptx")) if exports_dir.exists() else []
     all_pptx.extend(project_dir.glob("*.pptx"))
     all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
 
@@ -705,38 +943,36 @@ async def rebuild_pptx(task_id: str):
         logger.error("finalize_svg 失败: %s", result.stderr)
         raise HTTPException(500, f"finalize_svg 失败: {result.stderr[:500]}")
 
-    # Step 2: svg_to_pptx (native模式, 失败自动fallback到legacy)
+    # Step 2: svg_to_pptx (仅native模式)
     export_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir)]
     result = await asyncio.to_thread(
         subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
     )
     if result.returncode != 0:
+        # native失败 → 修复SVG后重试
         err_msg = result.stderr
-        # native模式失败 → fallback到legacy模式
-        fallback_keywords = [
-            "unsupported visual SVG element",
-            "SvgNativeConversionError",
-            "ParseError",
-        ]
-        if any(kw in err_msg for kw in fallback_keywords):
-            logger.warning("rebuild native失败, fallback到legacy: %s", err_msg[:200])
-            legacy_cmd = [sys.executable, str(SCRIPTS_DIR / "svg_to_pptx.py"), str(project_dir), "--only", "legacy"]
-            result2 = await asyncio.to_thread(
-                subprocess.run, legacy_cmd, capture_output=True, text=True, timeout=120
-            )
-            if result2.returncode != 0:
-                raise HTTPException(500, f"svg_to_pptx legacy也失败: {result2.stderr[:500]}")
-        else:
-            raise HTTPException(500, f"svg_to_pptx 失败: {err_msg[:500]}")
+        logger.warning("rebuild: native失败, 修复SVG后重试: %s", err_msg[:200])
+        svg_final_dir = project_dir / "svg_final"
+        if svg_final_dir.exists():
+            from .ppt_engine import PPTEngine
+            engine = PPTEngine(ConfigManager.load())
+            for svg_file in svg_final_dir.glob("*.svg"):
+                try:
+                    raw = svg_file.read_text(encoding="utf-8")
+                    fixed = engine._fix_svg(raw)
+                    if fixed != raw:
+                        svg_file.write_text(fixed, encoding="utf-8")
+                except Exception:
+                    pass
+        result2 = await asyncio.to_thread(
+            subprocess.run, export_cmd, capture_output=True, text=True, timeout=120
+        )
+        if result2.returncode != 0:
+            raise HTTPException(500, f"svg_to_pptx native重试也失败: {result2.stderr[:500]}")
 
-    # 搜索PPTX文件（exports/ + backup/ + 根目录）
-    all_pptx = []
+    # 搜索PPTX文件（exports/ + 根目录）
     exports_dir = project_dir / "exports"
-    if exports_dir.exists():
-        all_pptx.extend(exports_dir.glob("*.pptx"))
-    backup_dir = project_dir / "backup"
-    if backup_dir.exists():
-        all_pptx.extend(backup_dir.rglob("*.pptx"))
+    all_pptx = list(exports_dir.glob("*.pptx")) if exports_dir.exists() else []
     all_pptx.extend(project_dir.glob("*.pptx"))
     all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
 
@@ -813,6 +1049,7 @@ async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
         task["message"] = "设计方案已生成，请确认"
         task["progress"] = 25
         task["preview_data"] = preview_data
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "awaiting_confirm", "message": "设计方案已生成，请确认", "progress": 25, "status": "awaiting_confirm"}, loop=loop)
 
     except Exception as e:
@@ -820,6 +1057,7 @@ async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
         task["status"] = "error"
         task["message"] = f"设计方案生成失败: {e}"
         task["progress"] = 0
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
 
 
@@ -901,6 +1139,7 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
         task["progress"] = 100
         task["message"] = "PPT生成完成!"
         task["result_path"] = str(result_path)
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
 
     except Exception as e:
@@ -908,6 +1147,7 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
         task["status"] = "error"
         task["message"] = f"生成失败: {e}"
         task["progress"] = 0
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
 
 
@@ -939,6 +1179,7 @@ async def _run_generate(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
         task["progress"] = 100
         task["message"] = "PPT生成完成!"
         task["result_path"] = str(result_path)
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
 
     except Exception as e:
@@ -946,4 +1187,5 @@ async def _run_generate(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
         task["status"] = "error"
         task["message"] = f"生成失败: {e}"
         task["progress"] = 0
+        _save_task_meta(task_id, task)
         _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
