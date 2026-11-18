@@ -52,7 +52,7 @@ class LLMConfig(BaseModel):
     )
     max_output: int = Field(
         default=0,
-        description="单次最大输出tokens(0=使用场景默认值, 如32768/65536)",
+        description="单次最大输出tokens(0=使用场景默认值, 如32768/128000)",
     )
     reasoning_effort: str = Field(
         default="",

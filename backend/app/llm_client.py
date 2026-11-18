@@ -69,13 +69,13 @@ class LLMClient:
         self.model = config.model_name
         # 弱模型标记: 来自配置 or 自动检测
         self.is_weak = config.is_weak
-        # Qwen3.8 模型画像: 原生 262144 上下文 / 65536 输出，思考默认开启
+        # Qwen3.8 模型画像: 原生 262144 上下文；模型卡建议最终回答 131072，这里保守取 128000
         self.is_qwen38 = _is_qwen38(self.model)
         # 上下文长度限制 (0=不限)；Qwen3.8 未显式配置时使用模型能力
         self.max_context = config.max_context or (262144 if self.is_qwen38 else 0)
         # 单次输出上限 (0=使用各调用场景的默认值)
         self.max_output_limit = max(
-            0, config.max_output or (65536 if self.is_qwen38 else 0)
+            0, config.max_output or (128000 if self.is_qwen38 else 0)
         )
         # 思考深度: Qwen3.8 模板默认 xhigh，这里默认 medium 以平衡质量与耗时
         effort = config.reasoning_effort or ("medium" if self.is_qwen38 else "")

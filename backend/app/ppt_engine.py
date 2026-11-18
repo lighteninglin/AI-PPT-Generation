@@ -100,9 +100,8 @@ class PPTEngine:
         actual_name = project_name
         for line in result.splitlines():
             if "Project created:" in line or "[OK] Project initialized:" in line:
-                parts = line.rsplit("/", 1)
-                if len(parts) == 2:
-                    actual_name = parts[1].strip()
+                # 兼容 Linux('projects/name') 与 Windows('projects\name') 输出
+                actual_name = re.split(r"[\\/]", line.strip())[-1]
                 break
         project_path = PROJECTS_DIR / actual_name
 
@@ -583,8 +582,15 @@ class PPTEngine:
         except json.JSONDecodeError:
             pass
 
+        # 兼容 YAML 列表 + 逐行 JSON 对象格式
+        line_pages = self._parse_json_object_lines(resp.strip())
+        if line_pages:
+            logger.info("replan 返回 JSON-lines 解析成功: %d 页", len(line_pages))
+            return line_pages
+
         # 尝试从文本中提取JSON数组（括号平衡匹配，防止截断）
-        json_start = resp.find('[')
+        arr_match = re.search(r"\[\s*\{", resp)
+        json_start = arr_match.start() if arr_match else -1
         if json_start >= 0:
             depth = 0
             end = json_start
@@ -653,6 +659,45 @@ class PPTEngine:
         # 超过一半的页质量差 → 判定为低质量
         return weak_count > len(pages) * 0.5
 
+    @staticmethod
+    def _parse_json_object_lines(text: str) -> list[dict]:
+        """解析 YAML 列表中的逐行 JSON 对象：
+            - {"page_num":1,"title":"...","filename":"01_cover.svg",...}
+        模型实际输出常见这种“YAML 列表 + JSON 对象”混合格式。
+        """
+        pages: list[dict] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line.startswith("-"):
+                continue
+            candidate = line[1:].strip()
+            if not (candidate.startswith("{") and candidate.endswith("}")):
+                continue
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                pages.append(obj)
+        if not pages:
+            return []
+        for p in pages:
+            for k, v in list(p.items()):
+                if isinstance(v, str):
+                    p[k] = v.strip().strip('"').strip("'")
+            kp = p.get("key_points")
+            if isinstance(kp, list):
+                p["key_points"] = ", ".join(str(x) for x in kp)
+            fn = p.get("filename")
+            if isinstance(fn, str) and fn and not fn.endswith(".svg"):
+                p["filename"] = fn + ".svg"
+            try:
+                p["page_num"] = int(p.get("page_num", 0))
+            except (TypeError, ValueError):
+                pass
+        pages.sort(key=lambda p: int(p.get("page_num", 0) or 0))
+        return pages
+
     def _parse_page_plan(self, spec_lock: str) -> list[dict]:
         """从 spec_lock 中解析页面计划 (支持 JSON/YAML/Markdown 三种格式)"""
         pages: list[dict] = []
@@ -664,9 +709,16 @@ class PPTEngine:
         )
         section_text = pp_section.group(1) if pp_section else ""
 
+        # 方式0: YAML 列表 + 每行一个 JSON 对象（模型实际常用格式）
+        if section_text:
+            line_pages = self._parse_json_object_lines(section_text)
+            if line_pages:
+                logger.info("JSON-lines page_plan 解析成功: %d 页", len(line_pages))
+                return line_pages
+
         # 方式1: JSON 数组 (用括号平衡匹配, 不用非贪婪)
         if section_text:
-            json_match = re.search(r"\[", section_text)
+            json_match = re.search(r"\[\s*\{", section_text)
             if json_match:
                 # 括号平衡找到完整的 JSON 数组
                 start = json_match.start()
@@ -691,7 +743,12 @@ class PPTEngine:
                         pages.sort(key=lambda p: int(p.get("page_num", 0)))
                         logger.info("JSON page_plan 解析成功: %d 页", len(pages))
                         return pages
+                    # 关键: 非 dict 列表（例如字符串数组）不能留到后续 fallback，
+                    # 否则方式4的 `if pages` 会把残留字符串直接当页面计划返回。
+                    logger.warning("JSON page_plan 不是对象数组，忽略并继续解析: %s", type(pages).__name__)
+                    pages = []
                 except (json.JSONDecodeError, Exception) as e:
+                    pages = []
                     logger.warning("JSON page_plan 解析失败: %s", e)
 
         # 方式2: YAML 列表格式 (- page_num: N ...)
@@ -817,6 +874,7 @@ class PPTEngine:
                     "filename": f"slide_{i+1:02d}.svg",
                     "layout_hint": "content", "key_points": title,
                 })
+        pages = [p for p in pages if isinstance(p, dict)]
         if pages:
             return pages
 
@@ -843,6 +901,119 @@ class PPTEngine:
         if m:
             return m.group(1)
         return "#FFFFFF"
+
+    @staticmethod
+    def _trim_partial_svg(text: str) -> str:
+        """去掉截断处不完整的标签，避免续写从半个属性中间开始。"""
+        text = text.rstrip()
+        last_lt = text.rfind("<")
+        last_gt = text.rfind(">")
+        if last_lt > last_gt:
+            text = text[:last_lt].rstrip()
+        return text
+
+    @staticmethod
+    def _merge_svg_continuation(prefix: str, continuation: str) -> str:
+        """把续写结果拼到已生成 SVG 后面，尽量去掉模型重复的尾部。"""
+        cont = continuation.strip()
+        # 模型偶尔会重新包一层 markdown 代码块
+        cont = re.sub(r"^```(?:svg|xml)?\s*", "", cont, flags=re.IGNORECASE)
+        cont = re.sub(r"\s*```$", "", cont)
+        # 如果模型又重新开了 <svg>，去掉这个开头，保留后续内容
+        cont = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "", cont, flags=re.IGNORECASE)
+        cont = re.sub(r"^\s*<svg\b[^>]*>", "", cont, count=1, flags=re.IGNORECASE)
+        if not cont:
+            return prefix
+        # 去掉模型重复输出的尾部（最多比对 2000 字符）
+        max_check = min(2000, len(prefix), len(cont))
+        for k in range(max_check, 40, -1):
+            if prefix.endswith(cont[:k]):
+                cont = cont[k:]
+                break
+        return prefix + cont
+
+    def _generate_svg_with_continuation(
+        self,
+        system: str,
+        user_msg: str,
+        enable_thinking: bool,
+        max_output: int,
+        page_no: int,
+        max_continuations: int = 3,
+    ) -> str:
+        """生成单页 SVG；被截断时通过“断点续写”补全，而不是精简重写。"""
+        accumulated = ""
+        thinking = enable_thinking
+        continue_prompt = (
+            "上面的 SVG 输出因长度限制在 </svg> 之前被截断。"
+            "请严格从中断处继续输出剩余 SVG 内容，不要重复已输出的任何内容，"
+            "不要重新开始一个 <svg>，不要添加解释或代码块标记，"
+            "不要省略图形、文字或装饰，最后以 </svg> 结束。"
+        )
+
+        for round_no in range(max_continuations + 1):
+            if accumulated:
+                messages = [
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": accumulated},
+                    {"role": "user", "content": continue_prompt},
+                ]
+            else:
+                messages = [{"role": "user", "content": user_msg}]
+
+            try:
+                resp = self.llm.chat(
+                    messages,
+                    system_prompt=system,
+                    enable_thinking=thinking,
+                    max_output=max_output,
+                )
+            except LLMTruncatedError as e:
+                piece = self._trim_partial_svg(e.partial_text)
+                if not accumulated:
+                    accumulated = piece
+                else:
+                    accumulated = self._merge_svg_continuation(accumulated, piece)
+
+                logger.warning(
+                    "第 %d 页 SVG 输出被截断 (max_tokens=%s, 已生成 %d 字符)，"
+                    "第 %d/%d 次断点续写",
+                    page_no, e.max_tokens, len(accumulated),
+                    round_no + 1, max_continuations,
+                )
+
+                if "</svg>" in accumulated:
+                    break
+
+                # 截断发生在 <svg> 之前，通常是思考/说明占满了预算。
+                # 执行阶段不需要长思考，关闭思考后从头生成一次。
+                if "<svg" not in accumulated.lower():
+                    if thinking:
+                        logger.warning("第 %d 页截断发生在 SVG 之前，关闭思考后重新生成", page_no)
+                        thinking = False
+                        accumulated = ""
+                        continue
+                    logger.error("第 %d 页截断内容不含 <svg>，无法续写", page_no)
+                    break
+                continue
+
+            except RuntimeError as e:
+                # 续写请求本身失败（重试后仍失败）：保留已生成部分，交给 _fix_svg 修复。
+                if not accumulated:
+                    raise
+                logger.error("第 %d 页续写请求失败: %s，使用已生成部分修复", page_no, e)
+                break
+
+            else:
+                if accumulated:
+                    accumulated = self._merge_svg_continuation(accumulated, resp)
+                else:
+                    accumulated = resp
+                break
+
+        if accumulated and "</svg>" not in accumulated:
+            logger.error("第 %d 页续写 %d 次后仍未闭合，交由 _fix_svg 尽力修复", page_no, max_continuations)
+        return accumulated
 
     def _generate_svg_page(
         self, spec_lock: str, page_info: dict, page_idx: int, total: int, source_text: str = "", *, enable_thinking: bool = False
@@ -918,39 +1089,13 @@ class PPTEngine:
             )
 
         max_output = 16384
-        try:
-            resp = self.llm.chat(
-                [{"role": "user", "content": user_msg}],
-                system_prompt=system,
-                enable_thinking=enable_thinking,
-                max_output=max_output,
-            )
-        except LLMTruncatedError as e:
-            logger.warning(
-                "第 %d 页 SVG 输出被截断 (max_tokens=%s, 已生成 %d 字符)，使用精简提示词重试",
-                page_idx + 1, e.max_tokens, len(e.partial_text),
-            )
-            retry_msg = user_msg + (
-                "\n\n## 上次输出被截断（必须处理）\n"
-                "- 上次输出在 </svg> 之前被长度限制截断。\n"
-                "- 本次请精简装饰元素和文字数量，优先保证结构完整、所有标签闭合。\n"
-                "- 必须输出完整的 <svg>...</svg>。\n"
-            )
-            try:
-                resp = self.llm.chat(
-                    [{"role": "user", "content": retry_msg}],
-                    system_prompt=system + "\n输出必须精简，确保完整闭合。",
-                    enable_thinking=enable_thinking,
-                    max_output=max_output,
-                )
-            except LLMTruncatedError as e2:
-                # 两次都截断：保留已生成部分，交给 _extract_svg/_fix_svg 尽量修复，
-                # 避免单页失败导致整个生成任务崩溃。
-                logger.error(
-                    "第 %d 页 SVG 重试后仍被截断 (max_tokens=%s)，使用部分内容修复降级",
-                    page_idx + 1, e2.max_tokens,
-                )
-                resp = e2.partial_text
+        resp = self._generate_svg_with_continuation(
+            system=system,
+            user_msg=user_msg,
+            enable_thinking=enable_thinking,
+            max_output=max_output,
+            page_no=page_idx + 1,
+        )
         return self._extract_svg(resp)
 
     # ══════════════════════════════════════════════════════════

@@ -336,6 +336,20 @@ async def replan_pages(payload: ReplanPayload):
     if not pd:
         raise HTTPException(400, "无预览数据")
 
+    # 用户把页数改回原始规划时，直接清除 replanned_pages，
+    # 保证确认生成时使用的页面与前端右侧大纲一致，且无需再调用 LLM。
+    original_plan = pd.get("page_plan") or []
+    if original_plan and payload.target_pages == len(original_plan):
+        pd.pop("replanned_pages", None)
+        cf = pd.get("eight_confirmations", {})
+        pc = cf.get("page_count", {})
+        pc["recommended"] = payload.target_pages
+        cf["page_count"] = pc
+        pd["eight_confirmations"] = cf
+        task["preview_data"] = pd
+        logger.info("页数改回原始规划 %d 页，已清除 replanned_pages", payload.target_pages)
+        return {"page_plan": original_plan, "restored": True}
+
     cfg = ConfigManager.load()
     engine = PPTEngine(cfg)
     loop = asyncio.get_event_loop()
