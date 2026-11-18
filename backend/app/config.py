@@ -19,6 +19,17 @@ CONFIG_DIR = Path.home() / ".ppt-web"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
+def _env_int(name: str) -> int | None:
+    """读取整数环境变量；未设置或非法时返回 None（区别于显式设置为 0）。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        return None
+
+
 class LLMConfig(BaseModel):
     """LLM API 配置模型"""
 
@@ -37,7 +48,19 @@ class LLMConfig(BaseModel):
     )
     max_context: int = Field(
         default=0,
-        description="模型最大上下文长度(0=自动, 如65536/131072)",
+        description="模型最大上下文长度(0=自动, 如131072/262144)",
+    )
+    max_output: int = Field(
+        default=0,
+        description="单次最大输出tokens(0=使用场景默认值, 如32768/65536)",
+    )
+    reasoning_effort: str = Field(
+        default="",
+        description="Qwen3.8 思考深度(xhigh/medium/low, 空=模型默认)",
+    )
+    thinking_param_style: str = Field(
+        default="chat_template",
+        description="思考开关透传方式(chat_template/top_level/both)",
     )
 
     def is_configured(self) -> bool:
@@ -71,7 +94,16 @@ class ConfigManager:
         env_url = os.environ.get("LLM_BASE_URL", "").strip()
         env_model = os.environ.get("LLM_MODEL", "").strip()
         env_is_weak = os.environ.get("LLM_IS_WEAK", "").strip().lower() in ("1", "true", "yes")
-        env_max_context = int(os.environ.get("LLM_MAX_CONTEXT", "0") or "0")
+        # 注意: 必须区分“未设置”和“显式设置为 0”。
+        # 旧逻辑用 `or` 会让 .env 里的 LLM_MAX_CONTEXT=0 被 config.json 中的旧值覆盖。
+        env_max_context = _env_int("LLM_MAX_CONTEXT")
+        env_max_output = _env_int("LLM_MAX_OUTPUT")
+        env_effort = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
+        if env_effort not in ("xhigh", "medium", "low"):
+            env_effort = ""
+        env_style = os.environ.get("LLM_THINKING_PARAM_STYLE", "").strip().lower()
+        if env_style not in ("chat_template", "top_level", "both"):
+            env_style = ""
 
         # 自动检测: 模型名含 flash/mini/small/lite 视为弱模型
         model_lower = (env_model or file_cfg.get("model_name", "")).lower()
@@ -84,8 +116,29 @@ class ConfigManager:
             base_url=env_url or file_cfg.get("base_url", "https://api.openai.com/v1"),
             model_name=env_model or file_cfg.get("model_name", "gpt-4o"),
             is_weak=env_is_weak or file_cfg.get("is_weak", False) or auto_weak,
-            max_context=env_max_context or file_cfg.get("max_context", 0),
+            max_context=(
+                env_max_context
+                if env_max_context is not None
+                else max(0, int(file_cfg.get("max_context", 0) or 0))
+            ),
+            max_output=(
+                env_max_output
+                if env_max_output is not None
+                else max(0, int(file_cfg.get("max_output", 0) or 0))
+            ),
+            reasoning_effort=env_effort or str(file_cfg.get("reasoning_effort", "") or "").lower(),
+            thinking_param_style=(
+                env_style
+                or str(file_cfg.get("thinking_param_style", "") or "").lower()
+                or "chat_template"
+            ),
         )
+
+        # 防御: config.json 中可能残留非法的 reasoning_effort / 透传方式
+        if cfg.reasoning_effort not in ("xhigh", "medium", "low"):
+            cfg.reasoning_effort = ""
+        if cfg.thinking_param_style not in ("chat_template", "top_level", "both"):
+            cfg.thinking_param_style = "chat_template"
 
         # 环境变量存在时，同步更新 config.json（避免显示旧值）
         if env_key or env_url or env_model:
@@ -120,6 +173,9 @@ class ConfigManager:
             "model_name": config.model_name,
             "is_weak": config.is_weak,
             "max_context": config.max_context,
+            "max_output": config.max_output,
+            "reasoning_effort": config.reasoning_effort,
+            "thinking_param_style": config.thinking_param_style,
             "is_configured": config.is_configured(),
             "configured_via": "env" if ConfigManager.is_env_configured() else "file",
         }

@@ -23,7 +23,7 @@ from typing import Callable, Optional
 import xml.etree.ElementTree as ET
 
 from .config import LLMConfig
-from .llm_client import LLMClient
+from .llm_client import LLMClient, LLMTruncatedError
 
 logger = logging.getLogger(__name__)
 
@@ -917,16 +917,81 @@ class PPTEngine:
                 "- 绝对不能只有背景没有文字\n"
             )
 
-        resp = self.llm.chat(
-            [{"role": "user", "content": user_msg}],
-            system_prompt=system,
-            enable_thinking=enable_thinking,
-        )
+        max_output = 16384
+        try:
+            resp = self.llm.chat(
+                [{"role": "user", "content": user_msg}],
+                system_prompt=system,
+                enable_thinking=enable_thinking,
+                max_output=max_output,
+            )
+        except LLMTruncatedError as e:
+            logger.warning(
+                "第 %d 页 SVG 输出被截断 (max_tokens=%s, 已生成 %d 字符)，使用精简提示词重试",
+                page_idx + 1, e.max_tokens, len(e.partial_text),
+            )
+            retry_msg = user_msg + (
+                "\n\n## 上次输出被截断（必须处理）\n"
+                "- 上次输出在 </svg> 之前被长度限制截断。\n"
+                "- 本次请精简装饰元素和文字数量，优先保证结构完整、所有标签闭合。\n"
+                "- 必须输出完整的 <svg>...</svg>。\n"
+            )
+            try:
+                resp = self.llm.chat(
+                    [{"role": "user", "content": retry_msg}],
+                    system_prompt=system + "\n输出必须精简，确保完整闭合。",
+                    enable_thinking=enable_thinking,
+                    max_output=max_output,
+                )
+            except LLMTruncatedError as e2:
+                # 两次都截断：保留已生成部分，交给 _extract_svg/_fix_svg 尽量修复，
+                # 避免单页失败导致整个生成任务崩溃。
+                logger.error(
+                    "第 %d 页 SVG 重试后仍被截断 (max_tokens=%s)，使用部分内容修复降级",
+                    page_idx + 1, e2.max_tokens,
+                )
+                resp = e2.partial_text
         return self._extract_svg(resp)
 
     # ══════════════════════════════════════════════════════════
     #  SVG 修复 (弱模型常见错误)
     # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _close_unclosed_tags(svg: str) -> str:
+        """补全被截断/遗漏的结束标签（text、g、defs、linearGradient 等）。
+
+        只在根 </svg> 之前插入缺失的结束标签，避免破坏已闭合结构。
+        不处理注释/DOCTYPE；属性值中的 ">" 由引号规则跳过。
+        """
+        tag_re = re.compile(
+            r"<(/?)([A-Za-z][\w:.-]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*?)(/?)>",
+            re.DOTALL,
+        )
+        end = svg.rfind("</svg>")
+        body = svg[:end] if end != -1 else svg
+        tail = svg[end:] if end != -1 else ""
+
+        stack: list[str] = []
+        for m in tag_re.finditer(body):
+            closing, name, self_closing = m.group(1), m.group(2), m.group(4)
+            low = name.lower()
+            if closing:
+                # 只弹到最近的同名标签，容忍交叉闭合
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i].lower() == low:
+                        del stack[i:]
+                        break
+            elif self_closing or low == "svg":
+                # 根 svg 由 tail（或下方补全）负责
+                continue
+            else:
+                stack.append(name)
+
+        closes = "".join(f"</{name}>" for name in reversed(stack))
+        if not tail:
+            return body.rstrip() + closes + "\n</svg>"
+        return body.rstrip() + closes + "\n" + tail
 
     @staticmethod
     def _fix_svg(svg: str) -> str:
@@ -962,11 +1027,8 @@ class PPTEngine:
         # 4. 补全 </svg>
         if '</svg>' not in svg:
             svg = svg.rstrip() + '\n</svg>'
-        # 5. 补全未闭合的 <g> 标签 (在 </svg> 前补全)
-        open_g = len(re.findall(r'<g\b[^>]*>', svg))
-        close_g = len(re.findall(r'</g>', svg))
-        if open_g > close_g:
-            svg = svg.replace('</svg>', '</g>' * (open_g - close_g) + '\n</svg>')
+        # 5. 补全所有未闭合标签（被截断时常见：<text>/<g>/<defs> 未闭合）
+        svg = PPTEngine._close_unclosed_tags(svg)
 
         # ── 尝试 ET 解析 ──
         try:
@@ -1124,10 +1186,24 @@ class PPTEngine:
 
     @staticmethod
     def _extract_svg(text: str) -> str:
+        text = text.strip()
         if "<svg" in text:
             start = text.index("<svg")
-            end = text.rindex("</svg>") + 6
-            return text[start:end]
+            end = text.rfind("</svg>")
+            if end != -1 and end > start:
+                return text[start:end + 6]
+
+            # 输出被截断或模型漏写 </svg>：保留片段并尽量清理，
+            # 由 _fix_svg 补全未闭合标签，绝不能在这里抛异常导致整单失败。
+            fragment = text[start:]
+            fragment = re.split(r"\n```", fragment)[0].rstrip()
+            # 去掉末尾不完整的标签（例如被截断在属性中间：<text x="12）
+            fragment = re.sub(r"<[^<>]*$", "", fragment).rstrip()
+            logger.warning(
+                "_extract_svg: 未找到 </svg>（输出可能被截断），返回 %d 字符片段等待修复",
+                len(fragment),
+            )
+            return fragment
         m = re.search(r"```(?:xml|svg)?\s*\n(.*?)```", text, re.DOTALL)
         if m:
             return m.group(1).strip()
