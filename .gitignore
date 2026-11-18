@@ -1,4 +1,5 @@
 *.tar.gz
 *.tar
 dist/data/
+dist-arm64/
 __pycache__/
