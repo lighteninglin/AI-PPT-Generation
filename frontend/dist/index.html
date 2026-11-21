@@ -120,6 +120,25 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
   .plan-list{max-height:55vh}
 }
 .confirm-footer{position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--border);padding:16px 0;text-align:center;display:flex;gap:12px;justify-content:center;margin-top:8px}
+
+/* 最近任务 */
+.recent-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+.recent-head h2{margin-bottom:0}
+.recent-tip{font-size:.75em;color:var(--dim)}
+.recent-list{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.recent-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:#0f172a}
+.recent-main{flex:1;min-width:0}
+.recent-topic{font-weight:600;font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recent-meta{font-size:.78em;color:var(--dim);margin-top:3px;display:flex;align-items:center;gap:6px}
+.recent-dot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
+.recent-dot.busy{background:var(--warn)}
+.recent-dot.ok{background:var(--ok)}
+.recent-dot.err{background:var(--err)}
+.recent-btn{padding:6px 14px;font-size:.82em;white-space:nowrap;flex:none}
+/* toast */
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(12px);opacity:0;pointer-events:none;background:rgba(15,23,42,.97);border:1px solid var(--border);color:var(--text);padding:10px 18px;border-radius:10px;font-size:.88em;z-index:999;transition:all .25s;box-shadow:0 10px 30px rgba(0,0,0,.35);max-width:90vw}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:rgba(239,68,68,.55)}
 </style>
 </head>
 <body>
@@ -131,8 +150,8 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
   <div class="card">
     <h2>📝 内容输入</h2>
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('text')">✏️ 粘贴文本</button>
-      <button class="tab-btn" onclick="switchTab('file')">📎 上传文档</button>
+      <button class="tab-btn active" data-tab="text" onclick="switchTab('text')">✏️ 粘贴文本</button>
+      <button class="tab-btn" data-tab="file" onclick="switchTab('file')">📎 上传文档</button>
     </div>
     <div id="tab-text">
       <textarea id="sourceText" placeholder="请粘贴要生成PPT的文本内容..."></textarea>
@@ -166,6 +185,14 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
     <label style="display:flex;align-items:center;gap:6px;margin-top:12px;cursor:pointer">
       <input type="checkbox" id="thinkingCheck" style="width:auto"> 🧠 启用深度思考模式(耗时更长, 质量更好)
     </label>
+  </div>
+
+  <div class="card hidden" id="recentCard">
+    <div class="recent-head">
+      <h2>🕘 最近任务</h2>
+      <span class="recent-tip">关闭页面或服务重启后可从这里继续</span>
+    </div>
+    <div class="recent-list" id="recentList"></div>
   </div>
 
   <div style="text-align:center">
@@ -264,247 +291,874 @@ textarea{resize:vertical;min-height:100px;font-family:inherit}
       <h2 style="margin-top:12px;color:var(--err)">生成失败</h2>
       <p id="errorMsg" style="margin-top:10px;color:var(--dim);font-size:.9em;word-break:break-all"></p>
       <button class="btn btn-secondary" style="margin-top:16px" onclick="resetAll()">重新开始</button>
+      <button class="btn btn-secondary" style="margin-top:16px;margin-left:8px" onclick="goBackToInput()">← 返回内容输入</button>
     </div>
   </div>
 </div>
 </div><!-- /container -->
+<div id="toast"></div>
 
 <script>
 // ── 状态 ──
+const SESSION_KEY = 'ppt_web_session_v1';
 let currentTab = 'text';
 let currentTaskId = null;
 let previewData = null;
 let thinkingPref = localStorage.getItem('ppt_thinking') === 'true';
-// 页面规划重新生成状态
 let _originalPagePlan = null;
 let _originalPageCount = null;
+let _session = null;
+let _restoringInput = false;
+let _restoringDraft = false;
+let _modifiedCards = new Set();
+let _pollSeq = 0;
+let _inputSaveTimer = null;
+let _toastTimer = null;
+let _recentReqId = 0;
 let _replan = {
   pending: false, failed: false, timer: null, controller: null,
   token: 0, target: 0, startedAt: 0, ticker: null, mode: 'plan'
 };
 
-document.addEventListener('DOMContentLoaded', () => {
+// ══════════════════════════════════════════════════════════
+//  本地会话草稿（task_id / 输入 / 八项确认修改）
+// ══════════════════════════════════════════════════════════
+
+function _loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    return (s && typeof s === 'object') ? s : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _saveSession(patch) {
+  if (!_session) _session = {};
+  if (patch) {
+    for (const k in patch) {
+      if (Object.prototype.hasOwnProperty.call(patch, k)) _session[k] = patch[k];
+    }
+  }
+  _session.updated_at = Date.now();
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(_session));
+    return true;
+  } catch (e) {
+    // localStorage 配额不足：丢弃大原文，但保留 task_id / 确认草稿
+    try {
+      const slim = JSON.parse(JSON.stringify(_session));
+      if (slim.input) {
+        delete slim.input.source_text;
+        delete slim.input.file_text;
+        slim.input.text_truncated = true;
+      }
+      localStorage.setItem(SESSION_KEY, JSON.stringify(slim));
+      return true;
+    } catch (e2) {
+      console.warn('保存本地会话失败:', e2);
+    }
+  }
+  return false;
+}
+
+function _sessionForTask(taskId) {
+  return (_session && _session.task_id === taskId) ? _session : null;
+}
+
+function _clearTaskSession() {
+  if (!_session) return;
+  delete _session.task_id;
+  delete _session.confirm_draft;
+  delete _session.phase;
+  _saveSession(null);
+}
+
+function _captureInput() {
+  const info = document.getElementById('fileInfo');
+  return {
+    source_text: document.getElementById('sourceText').value,
+    topic: document.getElementById('topicInput').value,
+    format: document.getElementById('formatSelect').value,
+    thinking: document.getElementById('thinkingCheck').checked,
+    tab: currentTab,
+    file_text: document.getElementById('sourceContent').value,
+    file_name: info.dataset.filename || '',
+    file_char_count: parseInt(info.dataset.charCount || '0', 10) || 0
+  };
+}
+
+function _restoreInput(input) {
+  if (!input) return;
+  _restoringInput = true;
+  try {
+    if (typeof input.source_text === 'string') {
+      document.getElementById('sourceText').value = input.source_text;
+    }
+    if (typeof input.file_text === 'string') {
+      document.getElementById('sourceContent').value = input.file_text;
+    }
+    if (input.topic) document.getElementById('topicInput').value = input.topic;
+    if (input.format) document.getElementById('formatSelect').value = input.format;
+    if (typeof input.thinking === 'boolean') {
+      thinkingPref = input.thinking;
+      document.getElementById('thinkingCheck').checked = input.thinking;
+    }
+    const info = document.getElementById('fileInfo');
+    if (input.file_name) {
+      info.dataset.filename = input.file_name;
+      info.dataset.charCount = String(input.file_char_count || '');
+      info.classList.remove('hidden');
+      info.innerHTML = '✅ ' + escHtml(input.file_name) + (input.file_char_count ? ' (' + input.file_char_count + ' 字)' : '');
+    }
+    if (input.tab === 'file') {
+      switchTab('file');
+    } else {
+      switchTab('text');
+    }
+    if (input.text_truncated) {
+      showToast('⚠️ 原文过长，未能保存到浏览器；请重新粘贴/上传', 'err');
+    }
+  } finally {
+    _restoringInput = false;
+  }
+}
+
+function _scheduleInputSave() {
+  if (_restoringInput) return;
+  clearTimeout(_inputSaveTimer);
+  _inputSaveTimer = setTimeout(function () { _persistInputNow(); }, 400);
+}
+
+function _persistInputNow() {
+  if (_restoringInput) return;
+  _saveSession({ input: _captureInput() });
+}
+
+// ══════════════════════════════════════════════════════════
+//  Toast / 阶段切换
+// ══════════════════════════════════════════════════════════
+
+function showToast(msg, type) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'show' + (type ? ' ' + type : '');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function () { el.className = ''; }, type === 'err' ? 6000 : 4000);
+}
+
+function showPhase(p) {
+  ['input', 'confirm', 'progress', 'done', 'error'].forEach(function (x) {
+    document.getElementById('phase-' + x).classList.toggle('hidden', x !== p);
+  });
+  document.querySelector('.container').classList.toggle('confirm-wide', p === 'confirm');
+  if (p !== 'confirm') _cancelReplan();
+  if (p === 'input') _loadRecentTasks();
+}
+
+function showRestoring() {
+  document.getElementById('progressTitle').textContent = '🔄 正在恢复上次任务...';
+  updateProgressUI({ progress: 5, stage: 'restore', message: '正在读取服务器上的任务状态…' });
+  showPhase('progress');
+}
+
+function showProgressFor(task) {
+  const restoring = task && task.stage === 'restore';
+  let title = 'Step 1-4: 正在生成设计方案...';
+  if (task && (task.status === 'executing' || task.status === 'running')) {
+    title = 'Step 5-7: 正在生成PPT...';
+  }
+  document.getElementById('progressTitle').textContent = (restoring ? '🔄 ' : '⏳ ') + title;
+  updateProgressUI(task || {});
+  showPhase('progress');
+}
+
+// ══════════════════════════════════════════════════════════
+//  服务器任务读取 / 恢复
+// ══════════════════════════════════════════════════════════
+
+async function fetchTaskWithRetry(taskId, timeoutSeconds) {
+  const startedAt = Date.now();
+  let wait = 700;
+  let lastErr = null;
+  let notFoundHits = 0;
+  while (true) {
+    try {
+      const r = await fetch('/api/tasks/' + encodeURIComponent(taskId), { cache: 'no-store' });
+      if (r.ok) return await r.json();
+      if (r.status !== 404) notFoundHits = 0;
+      if (r.status === 404) {
+        notFoundHits++;
+        if (notFoundHits >= 4) {
+          const err = new Error('任务不存在');
+          err.status = 404;
+          throw err;
+        }
+      } else if (r.status < 500) {
+        const err = new Error('任务状态读取失败(' + r.status + ')');
+        err.status = r.status;
+        throw err;
+      }
+      lastErr = new Error(r.status === 404 ? '任务不存在' : '服务暂时不可用');
+      lastErr.status = r.status;
+    } catch (e) {
+      if (e.status === 404 && notFoundHits >= 4) throw e;
+      if (e.status && e.status !== 404 && e.status < 500) throw e;
+      lastErr = e;
+    }
+    if (Date.now() - startedAt >= timeoutSeconds * 1000) {
+      const err = new Error(lastErr && lastErr.message ? lastErr.message : '无法连接服务');
+      err.status = lastErr && lastErr.status;
+      throw err;
+    }
+    // 服务重启窗口内持续等待
+    document.getElementById('progressMsg').textContent = '服务重启中，正在重新连接…';
+    await new Promise(function (resolve) { setTimeout(resolve, wait); });
+    wait = Math.min(wait * 1.5, 4000);
+  }
+}
+
+async function fetchPreview(taskId) {
+  const r = await fetch('/api/tasks/' + encodeURIComponent(taskId) + '/preview', { cache: 'no-store' });
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const e = await r.json();
+      detail = e.detail || '';
+    } catch (_) {}
+    throw new Error(detail || '读取方案数据失败');
+  }
+  const data = await r.json();
+  return data.preview_data;
+}
+
+async function _prefillInputFromServer(taskId) {
+  // 换浏览器/清缓存恢复时，尽量把源文补回输入框（不覆盖用户已有输入）
+  try {
+    const sourceEl = document.getElementById('sourceText');
+    const fileEl = document.getElementById('sourceContent');
+    if (sourceEl.value || fileEl.value) return;
+    const pd = await fetchPreview(taskId);
+    if (!pd || !pd.source_text) return;
+    if (sourceEl.value || fileEl.value) return;
+    sourceEl.value = pd.source_text;
+    fileEl.value = pd.source_text;
+    if (pd.topic && !document.getElementById('topicInput').value) {
+      document.getElementById('topicInput').value = pd.topic;
+    }
+    _persistInputNow();
+  } catch (e) {}
+}
+
+async function resumeTask(taskId, restored) {
+  const seq = ++_pollSeq;
+  currentTaskId = taskId;
+  if (!_session) _session = {};
+  // 切换到另一个任务时，旧任务的确认草稿必须丢弃，避免套用到新任务
+  if (_session.task_id && _session.task_id !== taskId) delete _session.confirm_draft;
+  _saveSession({ task_id: taskId });
+  showRestoring();
+  try {
+    const task = await fetchTaskWithRetry(taskId, 60);
+    if (seq !== _pollSeq) return;
+    task.id = taskId;
+    currentTaskId = taskId;
+    _saveSession({ task_id: taskId, phase: task.status });
+    if (task.status !== 'awaiting_confirm') _prefillInputFromServer(taskId);
+
+    if (task.status === 'awaiting_confirm') {
+      await enterConfirm(taskId, task, true);
+    } else if (task.status === 'previewing' || task.status === 'running') {
+      showProgressFor(task);
+      connectWS(taskId);
+      pollUntil(taskId, 'awaiting_confirm', onPreviewDone, onError);
+      if (restored) showToast('✅ 已恢复上次进度：正在规划设计', 'ok');
+    } else if (task.status === 'executing') {
+      showProgressFor(task);
+      connectWS(taskId);
+      pollUntil(taskId, 'done', onExecuteDone, onError);
+      if (restored) showToast('✅ 已恢复上次进度：正在生成页面', 'ok');
+    } else if (task.status === 'done') {
+      onExecuteDone(task, true);
+    } else if (task.status === 'error') {
+      showError(task.message || '上次任务已中断', task);
+    } else {
+      showError('任务状态未知: ' + task.status, task);
+    }
+  } catch (e) {
+    if (seq !== _pollSeq) return;
+    currentTaskId = null;
+    _clearTaskSession();
+    showPhase('input');
+    _restoreInput(_session && _session.input);
+    const msg = (e && e.status === 404)
+      ? '上次任务已过期或不存在'
+      : ('无法恢复上次任务：' + (e && e.message ? e.message : '未知错误'));
+    showToast('⚠️ ' + msg, 'err');
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  最近任务
+// ══════════════════════════════════════════════════════════
+
+function _statusLabel(s) {
+  const map = {
+    previewing: '正在规划设计', running: '正在生成', awaiting_confirm: '待确认方案',
+    executing: '正在生成页面', done: '已完成', error: '已中断'
+  };
+  return map[s] || (s || '未知状态');
+}
+
+function _statusClass(s) {
+  if (s === 'done') return 'ok';
+  if (s === 'error') return 'err';
+  if (s === 'previewing' || s === 'executing' || s === 'running') return 'busy';
+  return '';
+}
+
+function _relTime(iso) {
+  if (!iso) return '未知时间';
+  const ts = new Date(iso).getTime();
+  if (!ts || isNaN(ts)) return '未知时间';
+  const diff = Math.max(0, Date.now() - ts);
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return mins + ' 分钟前';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + ' 小时前';
+  return Math.floor(hours / 24) + ' 天前';
+}
+
+async function _loadRecentTasks() {
+  const card = document.getElementById('recentCard');
+  if (!card) return;
+  if (currentTaskId) {
+    card.classList.add('hidden');
+    return;
+  }
+  const reqId = ++_recentReqId;
+  try {
+    const r = await fetch('/api/tasks/recent?limit=8', { cache: 'no-store' });
+    if (!r.ok) return;
+    if (reqId !== _recentReqId || currentTaskId) return;
+    const data = await r.json();
+    _renderRecentTasks(data.tasks || []);
+  } catch (e) {
+    // 服务不可用时静默隐藏，避免刷屏
+  }
+}
+
+function _renderRecentTasks(items) {
+  const card = document.getElementById('recentCard');
+  const list = document.getElementById('recentList');
+  if (!items.length) {
+    card.classList.add('hidden');
+    list.innerHTML = '';
+    return;
+  }
+  card.classList.remove('hidden');
+  list.innerHTML = items.map(function (t) {
+    const topic = t.topic || ('任务 ' + String(t.id || '').slice(0, 6));
+    const action = t.status === 'done' ? '查看结果' : (t.status === 'error' ? '查看' : '继续');
+    return '<div class="recent-item">'
+      + '<span class="recent-dot ' + _statusClass(t.status) + '"></span>'
+      + '<div class="recent-main">'
+      + '<div class="recent-topic">' + escHtml(topic) + '</div>'
+      + '<div class="recent-meta"><span>' + escHtml(_statusLabel(t.status)) + '</span><span>·</span><span>' + escHtml(_relTime(t.last_active || t.created_at)) + '</span></div>'
+      + '</div>'
+      + '<button class="btn btn-secondary recent-btn" data-task-id="' + escHtml(t.id) + '">' + action + '</button>'
+      + '</div>';
+  }).join('');
+  Array.from(list.querySelectorAll('.recent-btn')).forEach(function (btn) {
+    btn.addEventListener('click', function () { resumeTask(btn.dataset.taskId, true); });
+  });
+}
+
+// ══════════════════════════════════════════════════════════
+//  输入页
+// ══════════════════════════════════════════════════════════
+
+document.addEventListener('DOMContentLoaded', function () {
+  _session = _loadSession() || {};
+
   document.getElementById('thinkingCheck').checked = thinkingPref;
-  document.getElementById('thinkingCheck').addEventListener('change', e => {
+  document.getElementById('thinkingCheck').addEventListener('change', function (e) {
     thinkingPref = e.target.checked;
     localStorage.setItem('ppt_thinking', thinkingPref);
+    _scheduleInputSave();
   });
+
   const dz = document.getElementById('dropZone');
-  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
-  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
-  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); if(e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]); });
-  document.getElementById('fileInput').addEventListener('change', e => { if(e.target.files.length) uploadFile(e.target.files[0]); });
+  dz.addEventListener('dragover', function (e) { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', function () { dz.classList.remove('drag-over'); });
+  dz.addEventListener('drop', function (e) {
+    e.preventDefault();
+    dz.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+  });
+  document.getElementById('fileInput').addEventListener('change', function (e) {
+    if (e.target.files.length) uploadFile(e.target.files[0]);
+  });
+
+  document.getElementById('sourceText').addEventListener('input', _scheduleInputSave);
+  document.getElementById('topicInput').addEventListener('input', _scheduleInputSave);
+  document.getElementById('formatSelect').addEventListener('change', _scheduleInputSave);
+
+  _restoreInput(_session.input);
+
+  if (_session.task_id) {
+    resumeTask(_session.task_id, true);
+  } else {
+    showPhase('input');
+  }
+
+  window.addEventListener('beforeunload', function () {
+    if (!_restoringInput) _saveSession({ input: _captureInput() });
+    if (currentTaskId && previewData) _saveConfirmDraft();
+  });
 });
 
-function switchTab(tab) {
+function switchTab(tab, btn) {
   currentTab = tab;
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(function (b) { b.classList.remove('active'); });
+  let target = btn || null;
+  if (!target) {
+    document.querySelectorAll('.tab-btn').forEach(function (b) {
+      if (b.dataset.tab === tab) target = b;
+    });
+  }
+  if (target) target.classList.add('active');
   document.getElementById('tab-text').classList.toggle('hidden', tab !== 'text');
   document.getElementById('tab-file').classList.toggle('hidden', tab !== 'file');
+  _scheduleInputSave();
 }
 
 async function uploadFile(file) {
-  const fd = new FormData(); fd.append('file', file);
+  const fd = new FormData();
+  fd.append('file', file);
   try {
-    document.getElementById('fileInfo').classList.remove('hidden');
-    document.getElementById('fileInfo').textContent = '⏳ 正在解析...';
-    const r = await fetch('/api/upload', {method:'POST', body:fd});
-    if(!r.ok){const e=await r.json();throw new Error(e.detail||'上传失败');}
+    const info = document.getElementById('fileInfo');
+    info.classList.remove('hidden');
+    info.textContent = '⏳ 正在解析...';
+    const r = await fetch('/api/upload', { method: 'POST', body: fd });
+    if (!r.ok) {
+      const e = await r.json();
+      throw new Error(e.detail || '上传失败');
+    }
     const data = await r.json();
     document.getElementById('sourceContent').value = data.text;
-    document.getElementById('fileInfo').innerHTML = '✅ ' + data.filename + ' (' + data.char_count + ' 字)';
-    if(!document.getElementById('topicInput').value) document.getElementById('topicInput').value = file.name.replace(/\.[^.]+$/,'');
-  } catch(e) {
-    document.getElementById('fileInfo').innerHTML = '<span style="color:var(--err)">❌ '+e.message+'</span>';
+    info.dataset.filename = data.filename;
+    info.dataset.charCount = String(data.char_count);
+    info.innerHTML = '✅ ' + escHtml(data.filename) + ' (' + data.char_count + ' 字)';
+    if (!document.getElementById('topicInput').value) {
+      document.getElementById('topicInput').value = file.name.replace(/\.[^.]+$/, '');
+    }
+    _persistInputNow();
+    showToast('✅ 文件已解析', 'ok');
+  } catch (e) {
+    document.getElementById('fileInfo').innerHTML = '<span style="color:var(--err)">❌ ' + escHtml(e.message) + '</span>';
   }
 }
 
-// ── 阶段切换 ──
-function showPhase(p) {
-  ['input','confirm','progress','done','error'].forEach(x => document.getElementById('phase-'+x).classList.toggle('hidden', x!==p));
-  document.querySelector('.container').classList.toggle('confirm-wide', p==='confirm');
-  if(p !== 'confirm') _cancelReplan();
-}
-function goBackToInput() { showPhase('input'); }
-function resetAll() {
+function goBackToInput() {
   _cancelReplan();
-  currentTaskId=null; previewData=null;
-  _originalPagePlan=null; _originalPageCount=null;
+  const fallbackSource = (previewData && previewData.source_text) ? previewData.source_text : '';
+  const fallbackTopic = (previewData && previewData.topic) ? previewData.topic : '';
+  let inp = (_session && _session.input) ? _session.input : null;
+  if (!inp || (!inp.source_text && !inp.file_text)) {
+    inp = inp ? Object.assign({}, inp) : {};
+    if (fallbackSource) {
+      inp.source_text = fallbackSource;
+      inp.file_text = fallbackSource;
+      inp.tab = 'text';
+    }
+    if (fallbackTopic) inp.topic = fallbackTopic;
+  }
+  currentTaskId = null;
+  previewData = null;
+  _originalPagePlan = null;
+  _originalPageCount = null;
+  _clearTaskSession();
+  _restoreInput(inp);
   showPhase('input');
 }
 
-// ── Step 1-4: 生成预览 ──
-async function startPreview() {
-  let src = currentTab==='text' ? document.getElementById('sourceText').value.trim() : document.getElementById('sourceContent').value.trim();
-  const topic = document.getElementById('topicInput').value.trim();
-  if(!src){alert('请输入或上传内容');return;}
-  if(!topic){alert('请填写PPT主题');return;}
-
+function resetAll() {
   _cancelReplan();
-  _originalPagePlan=null; _originalPageCount=null;
-  previewData=null;
-  showPhase('progress');
-  document.getElementById('progressTitle').textContent='⏳ Step 1-4: 正在生成设计方案...';
-  updateProgressUI({progress:5,stage:'init',message:'创建项目中...'});
-
-  try {
-    const r = await fetch('/api/generate/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      source_text:src, topic:topic, format:document.getElementById('formatSelect').value, enable_thinking:thinkingPref
-    })});
-    if(!r.ok){const e=await r.json();throw new Error(e.detail||'请求失败');}
-    const d=await r.json();
-    currentTaskId=d.task_id;
-    connectWS(currentTaskId);
-    pollUntil(currentTaskId,'awaiting_confirm', onPreviewDone, onError);
-  } catch(e) { showError(e.message); }
-}
-
-function onPreviewDone(task) {
-  previewData = task.preview_data;
-  renderConfirmations(previewData.eight_confirmations);
-  renderPagePlan(previewData.page_plan);
-  // 以实际 page_plan 为“原规划”，供页数改回时无损恢复
-  _originalPagePlan = _clonePages(previewData.page_plan);
-  const countEl = document.querySelector('[data-cf="page_count.recommended"]');
-  if(countEl && _originalPagePlan.length) countEl.value = _originalPagePlan.length;
-  _originalPageCount = _originalPagePlan.length || (countEl ? parseInt(countEl.value)||0 : 0);
-  _cancelReplan();
-  _setPlanStatus('已同步','');
-  showPhase('confirm');
+  let inp = (_session && _session.input) ? _session.input : null;
+  if (!inp && previewData && previewData.source_text) {
+    inp = { source_text: previewData.source_text, file_text: previewData.source_text, topic: previewData.topic || '', tab: 'text' };
+  }
+  if (!inp) inp = _captureInput();
+  currentTaskId = null;
+  previewData = null;
+  _originalPagePlan = null;
+  _originalPageCount = null;
+  _clearTaskSession();
+  _restoreInput(inp);
+  showPhase('input');
 }
 
 // ══════════════════════════════════════════════════════════
-//  渲染 Eight Confirmations — 每项都是可编辑的卡片
+//  Step 1-4: 生成预览
+// ══════════════════════════════════════════════════════════
+
+async function startPreview() {
+  let src = currentTab === 'text'
+    ? document.getElementById('sourceText').value.trim()
+    : document.getElementById('sourceContent').value.trim();
+  const topic = document.getElementById('topicInput').value.trim();
+  if (!src) { alert('请输入或上传内容'); return; }
+  if (!topic) { alert('请填写PPT主题'); return; }
+
+  _cancelReplan();
+  _originalPagePlan = null;
+  _originalPageCount = null;
+  currentTaskId = null;
+  previewData = null;
+  _persistInputNow();
+  _clearTaskSession();
+  showPhase('progress');
+  document.getElementById('progressTitle').textContent = '⏳ Step 1-4: 正在生成设计方案...';
+  updateProgressUI({ progress: 5, stage: 'init', message: '创建项目中...' });
+  const btn = document.getElementById('previewBtn');
+  btn.disabled = true;
+
+  try {
+    const r = await fetch('/api/generate/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_text: src,
+        topic: topic,
+        source_type: currentTab,
+        format: document.getElementById('formatSelect').value,
+        enable_thinking: thinkingPref
+      })
+    });
+    if (!r.ok) {
+      const e = await r.json();
+      throw new Error(e.detail || '请求失败');
+    }
+    const d = await r.json();
+    currentTaskId = d.task_id;
+    if (!_session) _session = {};
+    _saveSession({ task_id: currentTaskId, phase: 'previewing', confirm_draft: null, input: _captureInput() });
+    connectWS(currentTaskId);
+    pollUntil(currentTaskId, 'awaiting_confirm', onPreviewDone, onError);
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function onPreviewDone(task) {
+  try {
+    await enterConfirm(task.id, task, false);
+  } catch (e) {
+    showError('读取方案数据失败: ' + (e && e.message ? e.message : e), task);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  确认页恢复 / 渲染
+// ══════════════════════════════════════════════════════════
+
+function _currentPlan() {
+  if (!previewData) return [];
+  const rp = previewData.replanned_pages;
+  if (rp && rp.length) return rp;
+  return previewData.page_plan || [];
+}
+
+async function enterConfirm(taskId, task, restored) {
+  const pd = await fetchPreview(taskId);
+  previewData = pd;
+  currentTaskId = taskId;
+  const originalPlan = pd.page_plan || [];
+  _originalPagePlan = _clonePages(originalPlan);
+  _originalPageCount = originalPlan.length;
+  _modifiedCards = new Set();
+
+  renderConfirmations(pd.eight_confirmations || {});
+  _cancelReplan();
+  const currentPlan = _currentPlan();
+  renderPagePlan(currentPlan);
+
+  const countEl = document.querySelector('[data-cf="page_count.recommended"]');
+  const sessionForTask = _sessionForTask(taskId);
+  const draft = sessionForTask ? sessionForTask.confirm_draft : null;
+  const draftCount = (draft && draft.page_count) ? parseInt(draft.page_count, 10) : 0;
+
+  if (draft) _applyConfirmDraft(draft);
+
+  if (countEl) {
+    const targetCount = draftCount
+      || currentPlan.length
+      || (pd.eight_confirmations && pd.eight_confirmations.page_count && pd.eight_confirmations.page_count.recommended)
+      || 8;
+    countEl.value = targetCount;
+  }
+
+  if (currentPlan.length !== _originalPageCount) _markCardModified(2);
+
+  // 换浏览器/清缓存恢复时，把方案原文补回输入框，方便“返回修改内容”
+  if (pd.source_text) {
+    const sourceEl = document.getElementById('sourceText');
+    const fileEl = document.getElementById('sourceContent');
+    if (!sourceEl.value) sourceEl.value = pd.source_text;
+    if (!fileEl.value) fileEl.value = pd.source_text;
+  }
+  if (pd.topic && !document.getElementById('topicInput').value) {
+    document.getElementById('topicInput').value = pd.topic;
+  }
+
+  // 把方案原文/主题同步进本地会话，便于返回修改和换浏览器恢复
+  if (!_session) _session = {};
+  const oldInput = (_session.input && typeof _session.input === 'object') ? _session.input : {};
+  _saveSession({
+    task_id: taskId,
+    phase: 'awaiting_confirm',
+    topic: pd.topic || task.topic || oldInput.topic || '',
+    input: {
+      source_text: pd.source_text || oldInput.source_text || '',
+      file_text: oldInput.file_text || '',
+      file_name: oldInput.file_name || '',
+      file_char_count: oldInput.file_char_count || 0,
+      topic: pd.topic || oldInput.topic || '',
+      format: oldInput.format || document.getElementById('formatSelect').value,
+      thinking: document.getElementById('thinkingCheck').checked,
+      tab: (oldInput.tab === 'file' && oldInput.file_text) ? 'file' : 'text'
+    }
+  });
+
+  showPhase('confirm');
+
+  // 服务端 replan 状态：规划中 / 失败 / 本地有未完成调整
+  const serverReplan = task && task.replan ? task.replan : null;
+  if (serverReplan && serverReplan.status === 'running') {
+    const target = parseInt(serverReplan.target, 10)
+      || (countEl ? parseInt(countEl.value, 10) || currentPlan.length : currentPlan.length);
+    if (countEl) countEl.value = target;
+    let startedAt = Date.now();
+    try {
+      if (serverReplan.started_at) startedAt = new Date(serverReplan.started_at).getTime() || startedAt;
+    } catch (e) {}
+    const token = _beginReplan(target, serverReplan.mode || 'plan', startedAt);
+    _waitServerReplan(token);
+  } else if (serverReplan && serverReplan.status === 'failed') {
+    const target = parseInt(serverReplan.target, 10) || currentPlan.length;
+    if (countEl) countEl.value = target;
+    _replan.pending = true;
+    _replan.failed = true;
+    _replan.target = target;
+    _replan.mode = serverReplan.mode || 'plan';
+    _setConfirmBusy(true);
+    _setPlanStatus('规划失败', 'err');
+    document.getElementById('planProgress').classList.add('hidden');
+    document.getElementById('pageList').classList.add('hidden');
+    document.getElementById('planErrorMsg').textContent = serverReplan.error || '重新规划失败，请重试';
+    document.getElementById('planError').classList.remove('hidden');
+    _setPlanSummary('failed', target);
+  } else if (draftCount && draftCount !== currentPlan.length) {
+    // 关闭页面时还有一次未完成的页数调整，自动接续
+    const target = Math.max(3, Math.min(30, draftCount));
+    if (countEl) countEl.value = target;
+    const token = _beginReplan(target, target === _originalPageCount ? 'restore' : 'plan');
+    _replan.timer = setTimeout(function () { _doReplan(target, token); }, 200);
+  }
+
+  if (restored) showToast('✅ 已恢复上次进度：待确认方案', 'ok');
+}
+
+// ══════════════════════════════════════════════════════════
+//  确认草稿
+// ══════════════════════════════════════════════════════════
+
+function _markCardModified(num) {
+  const el = document.getElementById('cf-status-' + num);
+  if (el) {
+    el.textContent = '已修改';
+    el.className = 'cf-status modified';
+  }
+  _modifiedCards.add(num);
+}
+
+function _applyConfirmDraft(draft) {
+  if (!draft || !draft.values) return;
+  _restoringDraft = true;
+  try {
+    document.querySelectorAll('[data-cf]').forEach(function (el) {
+      const key = el.dataset.cf;
+      if (key === '_colors') return;
+      if (Object.prototype.hasOwnProperty.call(draft.values, key)) {
+        el.value = String(draft.values[key]);
+        if (el.type === 'text' && el.previousElementSibling && el.previousElementSibling.type === 'color'
+          && /^#[0-9a-fA-F]{3,8}$/.test(el.value)) {
+          el.previousElementSibling.value = el.value;
+        }
+      }
+    });
+    if (draft.cards) draft.cards.forEach(function (n) { _markCardModified(n); });
+  } finally {
+    _restoringDraft = false;
+  }
+}
+
+function _saveConfirmDraft() {
+  if (!currentTaskId || !previewData || _restoringDraft) return;
+  const values = {};
+  document.querySelectorAll('[data-cf]').forEach(function (el) {
+    if (el.dataset.cf === '_colors') return;
+    values[el.dataset.cf] = el.value;
+  });
+  let pageCount = 0;
+  const countEl = document.querySelector('[data-cf="page_count.recommended"]');
+  if (countEl) pageCount = parseInt(countEl.value, 10) || 0;
+  if (!_sessionForTask(currentTaskId)) return;
+  _saveSession({
+    confirm_draft: {
+      values: values,
+      cards: Array.from(_modifiedCards),
+      page_count: pageCount,
+      updated_at: Date.now()
+    }
+  });
+}
+
+function markModified(num) {
+  _markCardModified(num);
+  _saveConfirmDraft();
+}
+
+// ══════════════════════════════════════════════════════════
+//  Eight Confirmations 渲染
 // ══════════════════════════════════════════════════════════
 
 function renderConfirmations(cf) {
-  if(!cf || typeof cf!=='object') cf={};
+  if (!cf || typeof cf !== 'object') cf = {};
   const c = document.getElementById('cfContainer');
   c.innerHTML = '';
 
-  // 1. 画布格式
   addCard(c, 1, '画布格式', [
-    {label:'格式', key:'canvas_format', type:'select', value: cf.canvas_format||'PPT 16:9 (1280×720)',
-     options:['PPT 16:9 (1280×720)','PPT 4:3 (960×720)','XHS 3:4 (1080×1440)']}
+    { label: '格式', key: 'canvas_format', type: 'select', value: cf.canvas_format || 'PPT 16:9 (1280×720)',
+      options: ['PPT 16:9 (1280×720)', 'PPT 4:3 (960×720)', 'XHS 3:4 (1080×1440)'] }
   ]);
 
-  // 2. 页数设置
-  const pc = cf.page_count||{};
+  const pc = cf.page_count || {};
   addCard(c, 2, '页数设置', [
-    {label:'页数', key:'page_count.recommended', type:'number', value: pc.recommended||8, min:3, max:30, onchange:'adjustPagePlan()'}
+    { label: '页数', key: 'page_count.recommended', type: 'number', value: pc.recommended || 8, min: 3, max: 30, onchange: 'adjustPagePlan()' }
   ]);
 
-  // 3. 目标受众
   addCard(c, 3, '目标受众', [
-    {label:'描述', key:'target_audience', type:'combobox', value: cf.target_audience||'', placeholder:'描述PPT的目标受众',
-     options:['领导/高管','内部团队','外部客户/合作伙伴','培训学员','行业专家','公众/社会大众','投资方','上级主管部门','同级同事','跨部门协作方']}
+    { label: '描述', key: 'target_audience', type: 'combobox', value: cf.target_audience || '', placeholder: '描述PPT的目标受众',
+      options: ['领导/高管', '内部团队', '外部客户/合作伙伴', '培训学员', '行业专家', '公众/社会大众', '投资方', '上级主管部门', '同级同事', '跨部门协作方'] }
   ]);
 
-  // 4. 风格目标 — Layer1模式选择 + Layer2自由描述
-  // 解析 style_objective: 支持 "B) General Consulting — 数据清晰优先" / "B) General Consulting - 数据清晰优先" / 纯文字
-  const _so = cf.style_objective || '';
+  const _so = String(cf.style_objective || '');
   const _soModeMatch = _so.match(/^[A-C]\)\s*[\w\s]+/);
   const _soSep = _so.includes('—') ? '—' : _so.includes('–') ? '–' : _so.includes(' - ') ? ' - ' : null;
-  let _soMode = '', _soStyle = '';
+  let _soMode = '';
+  let _soStyle = '';
   if (_soModeMatch) {
     _soMode = _soModeMatch[0].trim();
-    if (_soSep) {
-      _soStyle = _so.split(_soSep).slice(1).join(_soSep).trim();
-    }
+    if (_soSep) _soStyle = _so.split(_soSep).slice(1).join(_soSep).trim();
   } else if (_soSep) {
-    // 无A/B/C前缀但有分隔符: 第一段当模式, 后面当风格
     _soMode = _so.split(_soSep)[0].trim();
     _soStyle = _so.split(_soSep).slice(1).join(_soSep).trim();
   } else {
-    // 无法解析: 整个值放到风格描述
     _soStyle = _so;
   }
   addCard(c, 4, '风格目标', [
-    {label:'沟通模式', key:'style_objective.mode', type:'combobox', value: _soMode, placeholder:'选择沟通模式',
-     options:['A) General Versatile — 视觉冲击优先','B) General Consulting — 数据清晰优先','C) Top Consulting — 逻辑说服优先']},
-    {label:'视觉风格描述', key:'style_objective.style', type:'combobox', value: _soStyle, placeholder:'描述期望的视觉风格',
-     options:['neo-Chinese (新中式)','corporate-photo (商务摄影)','flat (扁平化)','editorial (编辑排版)','vivid-launch (炫酷发布会)','digital-dashboard (数据面板)','sketch-notes (手绘笔记)','vector-illustration (矢量插画)','screen-print (丝网印刷)','ink-notes (水墨笔记)','warm-earth (暖色调大地系)','cool-corporate (冷色调商务系)']}
+    { label: '沟通模式', key: 'style_objective.mode', type: 'combobox', value: _soMode, placeholder: '选择沟通模式',
+      options: ['A) General Versatile — 视觉冲击优先', 'B) General Consulting — 数据清晰优先', 'C) Top Consulting — 逻辑说服优先'] },
+    { label: '视觉风格描述', key: 'style_objective.style', type: 'combobox', value: _soStyle, placeholder: '描述期望的视觉风格',
+      options: ['neo-Chinese (新中式)', 'corporate-photo (商务摄影)', 'flat (扁平化)', 'editorial (编辑排版)', 'vivid-launch (炫酷发布会)', 'digital-dashboard (数据面板)', 'sketch-notes (手绘笔记)', 'vector-illustration (矢量插画)', 'screen-print (丝网印刷)', 'ink-notes (水墨笔记)', 'warm-earth (暖色调大地系)', 'cool-corporate (冷色调商务系)'] }
   ]);
 
-  // 5. 配色方案
-  const cs = cf.color_scheme||{};
+  const cs = cf.color_scheme || {};
   const colors = [];
-  ['primary','secondary','accent','background','text'].forEach(k => {
-    if(cs[k]) colors.push({label:k, key:'color_scheme.'+k, value:cs[k]});
+  ['primary', 'secondary', 'accent', 'background', 'text'].forEach(function (k) {
+    if (cs[k]) colors.push({ label: k, key: 'color_scheme.' + k, value: cs[k] });
   });
-  if(colors.length) {
+  if (colors.length) {
     addCard(c, 5, '配色方案', [
-      {label:'调色板', key:'_colors', type:'colors', colors: colors},
-      {label:'说明', key:'color_scheme.description', type:'text', value: cs.description||'', placeholder:'配色方案说明'}
+      { label: '调色板', key: '_colors', type: 'colors', colors: colors },
+      { label: '说明', key: 'color_scheme.description', type: 'text', value: cs.description || '', placeholder: '配色方案说明' }
     ]);
   } else {
     addCard(c, 5, '配色方案', [
-      {label:'说明', key:'color_scheme.description', type:'textarea', value: cs.description||'', placeholder:'请描述配色方案'}
+      { label: '说明', key: 'color_scheme.description', type: 'textarea', value: cs.description || '', placeholder: '请描述配色方案' }
     ]);
   }
 
-  // 6. 图标使用策略
   addCard(c, 6, '图标使用策略', [
-    {label:'图标来源', key:'icon_usage', type:'combobox', value: cf.icon_usage||'', placeholder:'选择图标使用策略',
-     options:['A) Emoji — 休闲、活泼、社交媒体','B) AI-generated — 需要定制风格','C) Built-in icon library — 专业场景(推荐)','D) Custom icons — 已有品牌图标']}
+    { label: '图标来源', key: 'icon_usage', type: 'combobox', value: cf.icon_usage || '', placeholder: '选择图标使用策略',
+      options: ['A) Emoji — 休闲、活泼、社交媒体', 'B) AI-generated — 需要定制风格', 'C) Built-in icon library — 专业场景(推荐)', 'D) Custom icons — 已有品牌图标'] }
   ]);
 
-  // 7. 字体方案
-  const tp = cf.typography||{};
+  const tp = cf.typography || {};
   addCard(c, 7, '字体方案', [
-    {label:'标题字体', key:'typography.heading_font', type:'combobox', value: tp.heading_font||'', placeholder:'选择或输入标题字体',
-     options:['Microsoft YaHei, PingFang SC, sans-serif','SimHei, Heiti SC, sans-serif','KaiTi, Georgia, serif','FangSong, Times New Roman, serif','Arial, Microsoft YaHei, sans-serif','Georgia, KaiTi, serif','Palatino, FangSong, serif','Impact, Arial Black, SimHei, sans-serif','Cambria, SimSun, serif']},
-    {label:'标题字号', key:'typography.heading_size', type:'combobox', value: tp.heading_size||'', placeholder:'例: 32-40px',
-     options:['28-36px','32-40px','36-44px','40-48px']},
-    {label:'正文字体', key:'typography.body_font', type:'combobox', value: tp.body_font||'', placeholder:'选择或输入正文字体',
-     options:['Microsoft YaHei, PingFang SC, sans-serif','SimHei, Heiti SC, sans-serif','SimSun, serif','Arial, Microsoft YaHei, sans-serif','Cambria, SimSun, serif','Times New Roman, SimSun, serif']},
-    {label:'正文字号', key:'typography.body_size', type:'combobox', value: tp.body_size||'', placeholder:'例: 18-22px',
-     options:['14-18px','16-20px','18-22px','20-24px']},
-    {label:'说明', key:'typography.description', type:'text', value: tp.description||'', placeholder:'字体方案说明'}
+    { label: '标题字体', key: 'typography.heading_font', type: 'combobox', value: tp.heading_font || '', placeholder: '选择或输入标题字体',
+      options: ['Microsoft YaHei, PingFang SC, sans-serif', 'SimHei, Heiti SC, sans-serif', 'KaiTi, Georgia, serif', 'FangSong, Times New Roman, serif', 'Arial, Microsoft YaHei, sans-serif', 'Georgia, KaiTi, serif', 'Palatino, FangSong, serif', 'Impact, Arial Black, SimHei, sans-serif', 'Cambria, SimSun, serif'] },
+    { label: '标题字号', key: 'typography.heading_size', type: 'combobox', value: tp.heading_size || '', placeholder: '例: 32-40px',
+      options: ['28-36px', '32-40px', '36-44px', '40-48px'] },
+    { label: '正文字体', key: 'typography.body_font', type: 'combobox', value: tp.body_font || '', placeholder: '选择或输入正文字体',
+      options: ['Microsoft YaHei, PingFang SC, sans-serif', 'SimHei, Heiti SC, sans-serif', 'SimSun, serif', 'Arial, Microsoft YaHei, sans-serif', 'Cambria, SimSun, serif', 'Times New Roman, SimSun, serif'] },
+    { label: '正文字号', key: 'typography.body_size', type: 'combobox', value: tp.body_size || '', placeholder: '例: 18-22px',
+      options: ['14-18px', '16-20px', '18-22px', '20-24px'] },
+    { label: '说明', key: 'typography.description', type: 'text', value: tp.description || '', placeholder: '字体方案说明' }
   ]);
 
-  // 8. 图片使用策略
   addCard(c, 8, '图片使用策略', [
-    {label:'图片来源', key:'image_usage', type:'combobox', value: cf.image_usage||'', placeholder:'选择图片使用策略',
-     options:['A) No images — 数据报告、流程文档','B) User-provided — 已有图片素材','C) AI-generated — 定制插画/背景','D) Web-sourced — 真实参考图/图库','E) Placeholders — 后续添加图片']}
+    { label: '图片来源', key: 'image_usage', type: 'combobox', value: cf.image_usage || '', placeholder: '选择图片使用策略',
+      options: ['A) No images — 数据报告、流程文档', 'B) User-provided — 已有图片素材', 'C) AI-generated — 定制插画/背景', 'D) Web-sourced — 真实参考图/图库', 'E) Placeholders — 后续添加图片'] }
   ]);
 }
 
 function addCard(container, num, title, fields) {
   const div = document.createElement('div');
   div.className = 'cf-card';
-  let html = `<div class="cf-header">
-    <div class="cf-title"><span class="cf-num">${num}</span> ${title}</div>
-    <div class="cf-status" id="cf-status-${num}">AI 推荐</div>
-  </div><div class="cf-body">`;
+  let html = '<div class="cf-header">'
+    + '<div class="cf-title"><span class="cf-num">' + num + '</span> ' + title + '</div>'
+    + '<div class="cf-status" id="cf-status-' + num + '">AI 推荐</div>'
+    + '</div><div class="cf-body">';
 
-  fields.forEach(f => {
-    if(f.type === 'select') {
-      html += `<div class="cf-row"><label>${f.label}</label><select data-cf="${f.key}" onchange="markModified(${num})">`;
-      f.options.forEach(o => { html += `<option value="${o}" ${o===f.value?'selected':''}>${o}</option>`; });
+  fields.forEach(function (f) {
+    if (f.type === 'select') {
+      html += '<div class="cf-row"><label>' + f.label + '</label><select data-cf="' + f.key + '" onchange="markModified(' + num + ')">';
+      f.options.forEach(function (o) {
+        html += '<option value="' + escHtml(o) + '" ' + (o === f.value ? 'selected' : '') + '>' + escHtml(o) + '</option>';
+      });
       html += '</select></div>';
-    } else if(f.type === 'combobox') {
-      const cbId = 'cb_' + f.key.replace(/[^a-zA-Z0-9]/g,'_');
-      html += `<div class="cf-row cb-wrap" style="position:relative"><label>${f.label}</label>`;
-      html += `<input type="text" data-cf="${f.key}" id="${cbId}" value="${escHtml(f.value)}" placeholder="${f.placeholder||''}" oninput="markModified(${num});_cbFilter(this)" onfocus="_cbShowAll(this)" autocomplete="off">`;
-      html += `<div class="cb-dropdown" id="${cbId}_dd">`;
-      (f.options||[]).forEach(o => { html += `<div class="cb-opt" onmousedown="_cbSelect(event,'${cbId}',this)" data-val="${escHtml(o)}">${escHtml(o)}</div>`; });
+    } else if (f.type === 'combobox') {
+      const cbId = 'cb_' + f.key.replace(/[^a-zA-Z0-9]/g, '_');
+      html += '<div class="cf-row cb-wrap" style="position:relative"><label>' + f.label + '</label>';
+      html += '<input type="text" data-cf="' + f.key + '" id="' + cbId + '" value="' + escHtml(f.value) + '" placeholder="' + (f.placeholder || '') + '" oninput="markModified(' + num + ');_cbFilter(this)" onfocus="_cbShowAll(this)" autocomplete="off">';
+      html += '<div class="cb-dropdown" id="' + cbId + '_dd">';
+      (f.options || []).forEach(function (o) {
+        html += '<div class="cb-opt" onmousedown="_cbSelect(event,\'' + cbId + '\',this)" data-val="' + escHtml(o) + '">' + escHtml(o) + '</div>';
+      });
       html += '</div></div>';
-    } else if(f.type === 'number') {
-      html += `<div class="cf-row"><label>${f.label}</label><input type="number" data-cf="${f.key}" value="${f.value}" min="${f.min||1}" max="${f.max||99}" onchange="markModified(${num});${f.onchange||''}"></div>`;
-    } else if(f.type === 'text') {
-      html += `<div class="cf-row"><label>${f.label}</label><input type="text" data-cf="${f.key}" value="${escHtml(f.value)}" placeholder="${f.placeholder||''}" oninput="markModified(${num})"></div>`;
-    } else if(f.type === 'textarea') {
-      html += `<div class="cf-row"><label>${f.label}</label><textarea data-cf="${f.key}" placeholder="${f.placeholder||''}" oninput="markModified(${num})">${escHtml(f.value)}</textarea></div>`;
-    } else if(f.type === 'colors') {
+    } else if (f.type === 'number') {
+      html += '<div class="cf-row"><label>' + f.label + '</label><input type="number" data-cf="' + f.key + '" value="' + escHtml(f.value) + '" min="' + (f.min || 1) + '" max="' + (f.max || 99) + '" onchange="markModified(' + num + ');' + (f.onchange || '') + '"></div>';
+    } else if (f.type === 'text') {
+      html += '<div class="cf-row"><label>' + f.label + '</label><input type="text" data-cf="' + f.key + '" value="' + escHtml(f.value) + '" placeholder="' + (f.placeholder || '') + '" oninput="markModified(' + num + ')"></div>';
+    } else if (f.type === 'textarea') {
+      html += '<div class="cf-row"><label>' + f.label + '</label><textarea data-cf="' + f.key + '" placeholder="' + (f.placeholder || '') + '" oninput="markModified(' + num + ')">' + escHtml(f.value) + '</textarea></div>';
+    } else if (f.type === 'colors') {
       html += '<div class="color-row">';
-      f.colors.forEach(c => {
-        html += `<div class="color-item">
-          <span>${c.label}</span>
-          <input type="color" value="${c.value}" onchange="this.nextElementSibling.value=this.value;markModified(${num})">
-          <input type="text" data-cf="${c.key}" value="${c.value}" oninput="this.previousElementSibling.value=this.value;markModified(${num})">
-        </div>`;
+      f.colors.forEach(function (c) {
+        html += '<div class="color-item">'
+          + '<span>' + c.label + '</span>'
+          + '<input type="color" value="' + escHtml(c.value) + '" onchange="this.nextElementSibling.value=this.value;markModified(' + num + ')">'
+          + '<input type="text" data-cf="' + c.key + '" value="' + escHtml(c.value) + '" oninput="this.previousElementSibling.value=this.value;markModified(' + num + ')">'
+          + '</div>';
       });
       html += '</div>';
     }
@@ -515,73 +1169,68 @@ function addCard(container, num, title, fields) {
   container.appendChild(div);
 }
 
-function markModified(num) {
-  const el = document.getElementById('cf-status-' + num);
-  if(el) { el.textContent = '已修改'; el.className = 'cf-status modified'; }
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
 
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
-
-// ── 自定义 Combobox (替代 datalist, 始终显示全部选项) ──
+// ── 自定义 Combobox ──
 function _cbShowAll(input) {
-  // 聚焦时关闭其他下拉，展示全部选项
-  document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+  document.querySelectorAll('.cb-dropdown').forEach(function (d) { d.style.display = 'none'; });
   const dd = document.getElementById(input.id + '_dd');
-  if(!dd) return;
-  dd.querySelectorAll('.cb-opt').forEach(opt => opt.style.display='');
+  if (!dd) return;
+  dd.querySelectorAll('.cb-opt').forEach(function (opt) { opt.style.display = ''; });
   dd.style.display = 'block';
-  // 点击外部关闭
-  setTimeout(() => document.addEventListener('mousedown', _cbCloseOutside, {once:false}), 0);
+  setTimeout(function () { document.addEventListener('mousedown', _cbCloseOutside, { once: false }); }, 0);
 }
+
 function _cbCloseOutside(e) {
-  // 如果点击不在 combobox 内部，关闭所有下拉
-  if(!e.target.closest('.cb-wrap')) {
-    document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+  if (!e.target.closest('.cb-wrap')) {
+    document.querySelectorAll('.cb-dropdown').forEach(function (d) { d.style.display = 'none'; });
   }
-  // 只在下拉可见时继续监听
-  const anyOpen = [...document.querySelectorAll('.cb-dropdown')].some(d => d.style.display==='block');
-  if(anyOpen) document.addEventListener('mousedown', _cbCloseOutside, {once:false});
+  const anyOpen = Array.from(document.querySelectorAll('.cb-dropdown')).some(function (d) { return d.style.display === 'block'; });
+  if (anyOpen) document.addEventListener('mousedown', _cbCloseOutside, { once: false });
 }
+
 function _cbFilter(input) {
   const dd = document.getElementById(input.id + '_dd');
-  if(!dd) return;
+  if (!dd) return;
   const val = input.value.toLowerCase();
-  dd.querySelectorAll('.cb-opt').forEach(opt => {
+  dd.querySelectorAll('.cb-opt').forEach(function (opt) {
     opt.style.display = (!val || opt.dataset.val.toLowerCase().includes(val)) ? '' : 'none';
   });
   dd.style.display = 'block';
-  document.addEventListener('mousedown', _cbCloseOutside, {once:false});
+  document.addEventListener('mousedown', _cbCloseOutside, { once: false });
 }
+
 function _cbSelect(e, inputId, opt) {
-  e.preventDefault(); // 阻止 blur 导致的关闭
+  e.preventDefault();
   const input = document.getElementById(inputId);
-  if(input) {
+  if (input) {
     input.value = opt.dataset.val;
-    input.dispatchEvent(new Event('input', {bubbles:true}));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  document.querySelectorAll('.cb-dropdown').forEach(d => d.style.display='none');
+  document.querySelectorAll('.cb-dropdown').forEach(function (d) { d.style.display = 'none'; });
 }
 
 function collectConfirmations() {
   const result = {};
-  document.querySelectorAll('[data-cf]').forEach(el => {
+  document.querySelectorAll('[data-cf]').forEach(function (el) {
     const path = el.dataset.cf;
-    if(path === '_colors') return; // 跳过颜色组标记
+    if (path === '_colors') return;
     const val = el.value;
     const parts = path.split('.');
     let obj = result;
-    for(let i=0;i<parts.length-1;i++) {
-      if(!obj[parts[i]]) obj[parts[i]] = {};
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!obj[parts[i]]) obj[parts[i]] = {};
       obj = obj[parts[i]];
     }
-    const last = parts[parts.length-1];
-    obj[last] = val==='' ? val : (isNaN(val) ? val : Number(val));
+    const last = parts[parts.length - 1];
+    obj[last] = val === '' ? val : (isNaN(val) ? val : Number(val));
   });
-  // 合并 style_objective.mode + style_objective.style → style_objective
   const so = result.style_objective || {};
   const mode = so.mode || '';
   const style = so.style || '';
-  if(mode || style) {
+  if (mode || style) {
     result.style_objective = (mode && style) ? mode + ' — ' + style : (mode || style);
   } else {
     delete result.style_objective;
@@ -589,106 +1238,110 @@ function collectConfirmations() {
   return result;
 }
 
-// ── 渲染 Page Plan ──
-function _clonePages(pages) { return JSON.parse(JSON.stringify(pages||[])); }
+// ══════════════════════════════════════════════════════════
+//  页面规划 / 重新规划
+// ══════════════════════════════════════════════════════════
+
+function _clonePages(pages) {
+  return JSON.parse(JSON.stringify(pages || []));
+}
 
 function _setPlanSummary(mode, n) {
   const el = document.getElementById('planSummary');
-  if(!el) return;
-  if(mode === 'pending') {
-    el.innerHTML = `目标 <span id="pageCount">${n}</span> 页 · AI 正在生成每页大纲…`;
-  } else if(mode === 'restore') {
-    el.innerHTML = `目标 <span id="pageCount">${n}</span> 页 · 正在恢复原规划…`;
-  } else if(mode === 'failed') {
-    el.innerHTML = `目标 <span id="pageCount">${n}</span> 页 · 规划失败，请重试`;
+  if (!el) return;
+  if (mode === 'pending') {
+    el.innerHTML = '目标 <span id="pageCount">' + n + '</span> 页 · AI 正在生成每页大纲…';
+  } else if (mode === 'restore') {
+    el.innerHTML = '目标 <span id="pageCount">' + n + '</span> 页 · 正在恢复原规划…';
+  } else if (mode === 'failed') {
+    el.innerHTML = '目标 <span id="pageCount">' + n + '</span> 页 · 规划失败，请重试';
   } else {
-    el.innerHTML = `共 <span id="pageCount">${n}</span> 页（确认后将按此规划生成）`;
+    el.innerHTML = '共 <span id="pageCount">' + n + '</span> 页（确认后将按此规划生成）';
   }
 }
 
 function _setPlanStatus(text, cls) {
   const el = document.getElementById('planStatus');
-  if(!el) return;
+  if (!el) return;
   el.textContent = text;
   el.className = 'plan-status' + (cls ? ' ' + cls : '');
 }
 
 function _setConfirmBusy(busy) {
   const btn = document.getElementById('confirmBtn');
-  if(!btn) return;
-  if(!btn.dataset.idleHtml) btn.dataset.idleHtml = btn.innerHTML;
+  if (!btn) return;
+  if (!btn.dataset.idleHtml) btn.dataset.idleHtml = btn.innerHTML;
   btn.disabled = busy;
   btn.innerHTML = busy ? '⏳ 正在重新规划大纲，请稍候…' : btn.dataset.idleHtml;
 }
 
 function renderPagePlan(pages) {
-  if(!pages) pages=[];
+  if (!pages) pages = [];
   document.getElementById('pageCount').textContent = pages.length;
   document.getElementById('planCountBadge').textContent = pages.length + ' 页';
   _setPlanSummary('idle', pages.length);
   const list = document.getElementById('pageList');
   list.innerHTML = '';
-  pages.forEach((p,i) => {
-    if(!p || typeof p !== 'object') p = {};
-    const hint = p.layout_hint||'content';
-    const label = hint==='cover'?'封面': (hint==='end'||hint==='ending'?'结束':'内容');
-    let title = String(p.title||('第'+(i+1)+'页'));
-    // 清理 JSON 残片标题
-    if(title.startsWith('{') || title.startsWith('"')) title = '第'+(i+1)+'页';
-    let fname = String(p.filename||'');
-    if(fname.startsWith('{') || fname.startsWith('"')) fname = '';
+  pages.forEach(function (p, i) {
+    if (!p || typeof p !== 'object') p = {};
+    const hint = p.layout_hint || 'content';
+    const label = hint === 'cover' ? '封面' : (hint === 'end' || hint === 'ending' ? '结束' : '内容');
+    let title = String(p.title || ('第' + (i + 1) + '页'));
+    if (title.startsWith('{') || title.startsWith('"')) title = '第' + (i + 1) + '页';
+    let fname = String(p.filename || '');
+    if (fname.startsWith('{') || fname.startsWith('"')) fname = '';
     let kp = p.key_points;
-    if(Array.isArray(kp)) kp = kp.join(' · ');
-    kp = String(kp||'').trim();
-    if(kp.startsWith('{') || kp.startsWith('"')) kp = '';
-    const kpShort = kp.length > 120 ? kp.slice(0,120) + '…' : kp;
-    list.innerHTML += `<div class="page-item"><div class="page-num">${i+1}</div><div class="page-info"><div class="page-title">${escHtml(title)}</div><div class="page-hint">${label}${fname?' · '+escHtml(fname):''}</div>${kpShort?`<div class="page-points" title="${escHtml(kp)}">${escHtml(kpShort)}</div>`:''}</div></div>`;
+    if (Array.isArray(kp)) kp = kp.join(' · ');
+    kp = String(kp || '').trim();
+    if (kp.startsWith('{') || kp.startsWith('"')) kp = '';
+    const kpShort = kp.length > 120 ? kp.slice(0, 120) + '…' : kp;
+    list.innerHTML += '<div class="page-item"><div class="page-num">' + (i + 1) + '</div><div class="page-info"><div class="page-title">' + escHtml(title) + '</div><div class="page-hint">' + label + (fname ? ' · ' + escHtml(fname) : '') + '</div>' + (kpShort ? '<div class="page-points" title="' + escHtml(kp) + '">' + escHtml(kpShort) + '</div>' : '') + '</div></div>';
   });
 }
 
-// ── 页数调整：右侧大纲实时规划，完成前阻塞“开始生成” ──
 function _updatePlanProgress() {
-  if(!_replan.pending) return;
+  if (!_replan.pending) return;
   const sec = Math.max(0, Math.floor((Date.now() - _replan.startedAt) / 1000));
   const elapsed = document.getElementById('planElapsed');
-  if(elapsed) elapsed.textContent = sec + 's';
+  if (elapsed) elapsed.textContent = sec + 's';
   const stageEl = document.getElementById('planStage');
-  if(!stageEl) return;
-  if(_replan.mode === 'restore') {
+  if (!stageEl) return;
+  if (_replan.mode === 'restore') {
     stageEl.textContent = '正在恢复原始页面规划并同步后端…';
     return;
   }
   let stage = '正在分析源内容结构…';
-  if(sec >= 6) stage = '正在分配每页主题与关键要点…';
-  if(sec >= 15) stage = '正在生成页面大纲…';
-  if(sec >= 30) stage = '模型仍在生成，请稍候…';
+  if (sec >= 6) stage = '正在分配每页主题与关键要点…';
+  if (sec >= 15) stage = '正在生成页面大纲…';
+  if (sec >= 30) stage = '模型仍在生成，请稍候…';
   stageEl.textContent = stage;
 }
 
-function _beginReplan(target, mode) {
-  if(_replan.timer) { clearTimeout(_replan.timer); _replan.timer = null; }
-  if(_replan.controller) { _replan.controller.abort(); _replan.controller = null; }
-  if(_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
+function _beginReplan(target, mode, startedAt) {
+  if (_replan.timer) { clearTimeout(_replan.timer); _replan.timer = null; }
+  if (_replan.controller) { _replan.controller.abort(); _replan.controller = null; }
+  if (_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
   _replan.pending = true;
   _replan.failed = false;
   _replan.mode = mode || 'plan';
   _replan.target = target;
-  _replan.startedAt = Date.now();
+  _replan.startedAt = startedAt || Date.now();
   const token = ++_replan.token;
 
   _setConfirmBusy(true);
-  _setPlanStatus(_replan.mode === 'restore' ? '恢复中' : 'AI 规划中','busy');
+  _setPlanStatus(_replan.mode === 'restore' ? '恢复中' : 'AI 规划中', 'busy');
   _setPlanSummary(_replan.mode === 'restore' ? 'restore' : 'pending', target);
   const titleEl = document.getElementById('planProgressTitleText');
-  if(titleEl) titleEl.textContent = _replan.mode === 'restore' ? '正在恢复原规划' : 'AI 正在重新规划每页大纲';
+  if (titleEl) titleEl.textContent = _replan.mode === 'restore' ? '正在恢复原规划' : 'AI 正在重新规划每页大纲';
   document.getElementById('planCountBadge').textContent = target + ' 页';
   document.getElementById('planProgress').classList.remove('hidden');
   document.getElementById('planError').classList.add('hidden');
   document.getElementById('pageList').classList.add('hidden');
   const targetEl = document.getElementById('planTargetCount');
-  if(targetEl) targetEl.textContent = target;
+  if (targetEl) targetEl.textContent = target;
   _updatePlanProgress();
   _replan.ticker = setInterval(_updatePlanProgress, 1000);
+  _saveConfirmDraft();
   return token;
 }
 
@@ -696,48 +1349,48 @@ function _finishReplan() {
   _replan.pending = false;
   _replan.failed = false;
   _replan.mode = 'plan';
-  if(_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
+  if (_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
   _replan.timer = null;
   _replan.controller = null;
   _setConfirmBusy(false);
-  _setPlanStatus('已同步','');
+  _setPlanStatus('已同步', '');
   document.getElementById('planProgress').classList.add('hidden');
   document.getElementById('planError').classList.add('hidden');
   document.getElementById('pageList').classList.remove('hidden');
 }
 
 function _failReplan(msg) {
-  // 保持 pending=true：规划没有成功，继续禁止进入生成步骤
   _replan.pending = true;
   _replan.failed = true;
-  if(_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
+  if (_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
   _replan.controller = null;
   _setConfirmBusy(true);
-  _setPlanStatus('规划失败','err');
+  _setPlanStatus('规划失败', 'err');
   document.getElementById('planProgress').classList.add('hidden');
   document.getElementById('pageList').classList.add('hidden');
   document.getElementById('planErrorMsg').textContent = msg || '重新规划失败，请重试';
   document.getElementById('planError').classList.remove('hidden');
   _setPlanSummary('failed', _replan.target);
+  _saveConfirmDraft();
 }
 
 function _cancelReplan() {
-  if(_replan.timer) { clearTimeout(_replan.timer); _replan.timer = null; }
-  if(_replan.controller) { _replan.controller.abort(); _replan.controller = null; }
-  if(_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
+  if (_replan.timer) { clearTimeout(_replan.timer); _replan.timer = null; }
+  if (_replan.controller) { _replan.controller.abort(); _replan.controller = null; }
+  if (_replan.ticker) { clearInterval(_replan.ticker); _replan.ticker = null; }
   _replan.pending = false;
   _replan.failed = false;
   _replan.mode = 'plan';
   _replan.token++;
   _setConfirmBusy(false);
   const progress = document.getElementById('planProgress');
-  if(progress) progress.classList.add('hidden');
+  if (progress) progress.classList.add('hidden');
   const err = document.getElementById('planError');
-  if(err) err.classList.add('hidden');
+  if (err) err.classList.add('hidden');
   const list = document.getElementById('pageList');
-  if(list) list.classList.remove('hidden');
-  _setPlanStatus('已同步','');
-  if(previewData) _setPlanSummary('idle', (previewData.page_plan||[]).length);
+  if (list) list.classList.remove('hidden');
+  _setPlanStatus('已同步', '');
+  if (previewData) _setPlanSummary('idle', _currentPlan().length);
 }
 
 async function _doReplan(target, token) {
@@ -746,7 +1399,7 @@ async function _doReplan(target, token) {
   try {
     const r = await fetch('/api/generate/replan', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         task_id: currentTaskId,
         target_pages: target,
@@ -754,143 +1407,300 @@ async function _doReplan(target, token) {
       }),
       signal: controller.signal
     });
-    if(token !== _replan.token) return;
-    if(!r.ok) {
+    if (token !== _replan.token) return;
+    if (r.status === 409) {
+      // 另一个标签页/服务端已开始规划，改为等待其结果
+      _replan.controller = null;
+      _waitServerReplan(token);
+      return;
+    }
+    if (!r.ok) {
       let msg = '重新规划失败';
-      try { const e = await r.json(); msg = e.detail || msg; } catch(_) {}
+      try {
+        const e = await r.json();
+        msg = e.detail || msg;
+      } catch (_) {}
       throw new Error(msg);
     }
     const data = await r.json();
-    if(token !== _replan.token) return;
-    if(!data.page_plan || data.page_plan.length === 0) {
-      throw new Error('AI 未返回页面规划，请重试');
+    if (token !== _replan.token) return;
+    const pages = data.page_plan || [];
+    if (!pages.length) {
+      // 服务端可能仍在后台规划（或此次响应丢失），改为轮询任务状态
+      _replan.controller = null;
+      _waitServerReplan(token);
+      return;
     }
-    previewData.page_plan = data.page_plan;
-    renderPagePlan(data.page_plan);
-    if(_replan.mode === 'restore') {
-      const countEl = document.querySelector('[data-cf="page_count.recommended"]');
-      if(countEl) countEl.value = target;
+    if (_replan.mode === 'restore') {
+      previewData.page_plan = pages;
+      delete previewData.replanned_pages;
+    } else {
+      previewData.replanned_pages = pages;
     }
+    renderPagePlan(pages);
+    const countEl = document.querySelector('[data-cf="page_count.recommended"]');
+    if (countEl) countEl.value = pages.length;
     _finishReplan();
-  } catch(e) {
-    if(e.name === 'AbortError' || token !== _replan.token) return;
+    _saveConfirmDraft();
+  } catch (e) {
+    if (e.name === 'AbortError' || token !== _replan.token) return;
+    if (e instanceof TypeError) {
+      // 网络中断：服务端可能仍在规划，改为轮询任务状态
+      _replan.controller = null;
+      _waitServerReplan(token);
+      return;
+    }
     console.error('replan失败:', e);
     _failReplan(e.message || '重新规划失败');
   }
 }
 
+async function _waitServerReplan(token) {
+  const taskId = currentTaskId;
+  let failures = 0;
+  while (token === _replan.token && currentTaskId === taskId) {
+    await new Promise(function (resolve) { setTimeout(resolve, 1500); });
+    if (token !== _replan.token || currentTaskId !== taskId) return;
+    try {
+      const r = await fetch('/api/tasks/' + encodeURIComponent(taskId), { cache: 'no-store' });
+      if (r.status === 404) {
+        failures++;
+        if (failures > 20) { _failReplan('无法连接服务，规划状态未知'); return; }
+        continue;
+      }
+      if (!r.ok) throw new Error('状态读取失败');
+      failures = 0;
+      const t = await r.json();
+      const rep = t.replan;
+      if (!rep || rep.status !== 'running') {
+        if (rep && rep.status === 'failed') { _failReplan(rep.error || '重新规划失败'); return; }
+        if (t.status === 'error') { _failReplan(t.message || '任务已中断'); return; }
+        const pd = await fetchPreview(taskId);
+        if (token !== _replan.token) return;
+        previewData = pd;
+        const pages = _currentPlan();
+        renderPagePlan(pages);
+        const countEl = document.querySelector('[data-cf="page_count.recommended"]');
+        if (countEl) countEl.value = pages.length;
+        _finishReplan();
+        _saveConfirmDraft();
+        return;
+      }
+    } catch (e) {
+      failures++;
+      if (failures > 20) { _failReplan('无法连接服务，规划状态未知'); return; }
+    }
+  }
+}
+
 function adjustPagePlan() {
-  if(!previewData || !currentTaskId) return;
+  if (!previewData || !currentTaskId) return;
   const el = document.querySelector('[data-cf="page_count.recommended"]');
-  if(!el) return;
-  const targetCount = Math.max(3, Math.min(30, parseInt(el.value) || 8));
+  if (!el) return;
+  let targetCount = parseInt(el.value, 10);
+  if (!targetCount || targetCount < 3) targetCount = 3;
+  if (targetCount > 30) targetCount = 30;
   el.value = targetCount;
-  const currentCount = (previewData.page_plan || []).length;
+  const currentCount = _currentPlan().length;
 
-  // 同一目标正在规划/已规划失败时，不因输入框失焦的 change 重复发起请求，
-  // 否则用户点击“重试/恢复原规划”时，mousedown 的 blur→change 会抢跑并隐藏错误面板。
-  if((_replan.pending || _replan.failed) && targetCount === _replan.target) return;
+  if (_replan.pending) {
+    if (targetCount !== _replan.target) el.value = _replan.target;
+    return;
+  }
+  if (_replan.failed && targetCount === _replan.target) return;
 
-  // 与当前规划一致且没有进行中的任务：无需重复请求
-  if(!_replan.pending && !_replan.failed && targetCount === currentCount) {
+  if (targetCount === currentCount) {
     _setPlanSummary('idle', currentCount);
+    _saveConfirmDraft();
     return;
   }
 
-  // 改回原始页数：调用后端恢复分支（清除 replanned_pages），保证确认生成时
-  // 使用的页面与右侧大纲一致，不需要再让 LLM 重新规划。
-  if(targetCount === _originalPageCount && _originalPagePlan) {
+  if (targetCount === _originalPageCount && _originalPagePlan) {
     const token = _beginReplan(targetCount, 'restore');
-    _replan.timer = setTimeout(() => _doReplan(targetCount, token), 50);
+    _replan.timer = setTimeout(function () { _doReplan(targetCount, token); }, 50);
     return;
   }
 
-  // 防抖：停止输入 650ms 后请求；等待期间立即进入“规划中”阻塞状态
-  const token = _beginReplan(targetCount);
-  _replan.timer = setTimeout(() => _doReplan(targetCount, token), 650);
+  const token = _beginReplan(targetCount, 'plan');
+  _replan.timer = setTimeout(function () { _doReplan(targetCount, token); }, 650);
 }
 
 function _retryReplan() {
-  if(!previewData || !currentTaskId) return;
-  const target = _replan.target || (previewData.page_plan || []).length;
+  if (!previewData || !currentTaskId) return;
+  const target = _replan.target || _currentPlan().length;
   const token = _beginReplan(target, _replan.mode === 'restore' ? 'restore' : 'plan');
-  _replan.timer = setTimeout(() => _doReplan(target, token), 100);
+  _replan.timer = setTimeout(function () { _doReplan(target, token); }, 100);
 }
 
 function _restoreOriginalPlan() {
-  if(!previewData || !currentTaskId || !_originalPageCount) return;
+  if (!previewData || !currentTaskId || !_originalPageCount) return;
   const token = _beginReplan(_originalPageCount, 'restore');
-  _replan.timer = setTimeout(() => _doReplan(_originalPageCount, token), 50);
+  _replan.timer = setTimeout(function () { _doReplan(_originalPageCount, token); }, 50);
 }
 
-// ── 确认并执行 ──
+// ══════════════════════════════════════════════════════════
+//  Step 5-7: 确认并执行
+// ══════════════════════════════════════════════════════════
+
 async function confirmAndExecute() {
-  if(!currentTaskId||!previewData) return;
-  // 页数重新规划尚未完成（或失败待处理）时禁止进入生成步骤
-  if(_replan.pending) return;
+  if (!currentTaskId || !previewData) return;
+  if (_replan.pending) return;
+  _saveConfirmDraft();
   const confirmations = collectConfirmations();
 
   showPhase('progress');
-  document.getElementById('progressTitle').textContent='⏳ Step 5-7: 正在生成PPT...';
-  updateProgressUI({progress:25,stage:'step5',message:'准备中...'});
+  document.getElementById('progressTitle').textContent = '⏳ Step 5-7: 正在生成PPT...';
+  updateProgressUI({ progress: 25, stage: 'step5', message: '准备中...' });
 
   try {
-    const r = await fetch('/api/generate/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      task_id:currentTaskId, confirmations:confirmations, spec_lock:null, enable_thinking:thinkingPref
-    })});
-    if(!r.ok){const e=await r.json();throw new Error(e.detail||'确认失败');}
-    pollUntil(currentTaskId,'done', onExecuteDone, onError);
-  } catch(e) { showError(e.message); }
+    const r = await fetch('/api/generate/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        task_id: currentTaskId,
+        confirmations: confirmations,
+        spec_lock: null,
+        enable_thinking: thinkingPref
+      })
+    });
+    if (!r.ok) {
+      const e = await r.json();
+      throw new Error(e.detail || '确认失败');
+    }
+    _saveSession({ task_id: currentTaskId, phase: 'executing' });
+    connectWS(currentTaskId);
+    pollUntil(currentTaskId, 'done', onExecuteDone, onError);
+  } catch (e) {
+    showError(e.message);
+  }
 }
 
-function onExecuteDone(task) {
-  document.getElementById('downloadBtn').href='/api/download/'+task.id;
-  document.getElementById('previewLink').href='/api/preview/'+task.id;
-  var previewFullUrl=location.origin+'/api/preview/'+task.id;
-  document.getElementById('previewUrl').textContent=previewFullUrl;
-  document.getElementById('bookmarkHint').style.display='block';
+function onExecuteDone(task, restored) {
+  const taskId = (task && task.id) ? task.id : currentTaskId;
+  if (!taskId) return;
+  currentTaskId = taskId;
+  document.getElementById('downloadBtn').href = '/api/download/' + encodeURIComponent(taskId);
+  document.getElementById('previewLink').href = '/api/preview/' + encodeURIComponent(taskId);
+  const previewFullUrl = location.origin + '/api/preview/' + taskId;
+  document.getElementById('previewUrl').textContent = previewFullUrl;
+  document.getElementById('bookmarkHint').style.display = 'block';
   showPhase('done');
+  _saveSession({ task_id: taskId, phase: 'done' });
+  if (restored) showToast('✅ 已恢复上次完成的 PPT', 'ok');
 }
 
 function copyPreviewLink(btn) {
-  var url=document.getElementById('previewUrl').textContent;
-  if(navigator.clipboard){navigator.clipboard.writeText(url).then(function(){btn.textContent='✅ 已复制';setTimeout(function(){btn.textContent='📋 复制链接'},2000)});}
-  else{var ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);btn.textContent='✅ 已复制';setTimeout(function(){btn.textContent='📋 复制链接'},2000);}
+  const url = document.getElementById('previewUrl').textContent;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(function () {
+      btn.textContent = '✅ 已复制';
+      setTimeout(function () { btn.textContent = '📋 复制链接'; }, 2000);
+    });
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✅ 已复制';
+    setTimeout(function () { btn.textContent = '📋 复制链接'; }, 2000);
+  }
 }
 
-function onError(task) { showError(task.message); }
+function onError(task) {
+  currentTaskId = (task && task.id) ? task.id : currentTaskId;
+  showError((task && task.message) ? task.message : '生成中断', task);
+}
 
-// ── 轮询 ──
+function showError(msg, task) {
+  document.getElementById('errorMsg').textContent = msg || '任务已中断';
+  showPhase('error');
+  if (currentTaskId) _saveSession({ task_id: currentTaskId, phase: 'error' });
+}
+
+// ══════════════════════════════════════════════════════════
+//  轮询 / WebSocket / 进度
+// ══════════════════════════════════════════════════════════
+
 function pollUntil(taskId, target, onDone, onErr) {
-  const iv = setInterval(async () => {
+  const seq = ++_pollSeq;
+  let failures = 0;
+  let firstFailureAt = 0;
+  let lastProgress = 0;
+
+  async function tick() {
+    if (seq !== _pollSeq || currentTaskId !== taskId) return;
     try {
-      const r = await fetch('/api/tasks/'+taskId);
+      const r = await fetch('/api/tasks/' + encodeURIComponent(taskId), { cache: 'no-store' });
+      if (r.status === 404) {
+        if (!firstFailureAt) firstFailureAt = Date.now();
+        failures++;
+        if (Date.now() - firstFailureAt > 90000) {
+          onErr({ id: taskId, status: 'error', message: '任务已过期或服务未能恢复' });
+          return;
+        }
+        updateProgressUI({ progress: lastProgress, stage: 'waiting_service', message: '服务重启中，正在重新连接…' });
+        setTimeout(tick, Math.min(1000 + failures * 500, 4000));
+        return;
+      }
+      if (!r.ok) throw new Error('状态读取失败: ' + r.status);
+      failures = 0;
+      firstFailureAt = 0;
       const t = await r.json();
+      t.id = taskId;
+      if (typeof t.progress === 'number') lastProgress = t.progress;
       updateProgressUI(t);
-      if(t.status===target) { clearInterval(iv); onDone(t); }
-      else if(t.status==='error') { clearInterval(iv); onErr(t); }
-    } catch(e) {}
-  }, 1500);
+      if (t.status === target) {
+        try {
+          const ret = onDone(t);
+          if (ret && ret.catch) ret.catch(function (e) { onErr({ id: taskId, status: 'error', message: e && e.message ? e.message : '处理任务结果失败' }); });
+        } catch (e) {
+          onErr({ id: taskId, status: 'error', message: e && e.message ? e.message : '处理任务结果失败' });
+        }
+        return;
+      }
+      if (t.status === 'error') {
+        onErr(t);
+        return;
+      }
+      setTimeout(tick, 1500);
+    } catch (e) {
+      if (seq !== _pollSeq) return;
+      if (!firstFailureAt) firstFailureAt = Date.now();
+      failures++;
+      if (Date.now() - firstFailureAt > 90000) {
+        onErr({ id: taskId, status: 'error', message: '无法连接服务: ' + (e && e.message ? e.message : '') });
+        return;
+      }
+      setTimeout(tick, 2000);
+    }
+  }
+  tick();
 }
 
 function updateProgressUI(t) {
-  const p = t.progress||0;
-  document.getElementById('progressFill').style.width = p+'%';
-  document.getElementById('progressPct').textContent = p+'%';
-  document.getElementById('progressStage').textContent = (t.stage||'').replace(/_/g,' ').toUpperCase();
-  document.getElementById('progressMsg').textContent = t.message||'';
+  const p = t.progress || 0;
+  document.getElementById('progressFill').style.width = p + '%';
+  document.getElementById('progressPct').textContent = p + '%';
+  document.getElementById('progressStage').textContent = (t.stage || '').replace(/_/g, ' ').toUpperCase();
+  document.getElementById('progressMsg').textContent = t.message || '';
 }
 
-// ── WebSocket ──
 function connectWS(taskId) {
   try {
-    const proto = location.protocol==='https:'?'wss':'ws';
-    const ws = new WebSocket(proto+'://'+location.host+'/ws/tasks/'+taskId);
-    ws.onmessage = e => { try{const d=JSON.parse(e.data);updateProgressUI(d);}catch(err){} };
-  } catch(e) {}
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host + '/ws/tasks/' + taskId);
+    ws.onmessage = function (e) {
+      if (currentTaskId !== taskId) return;
+      try {
+        const d = JSON.parse(e.data);
+        updateProgressUI(d);
+      } catch (err) {}
+    };
+  } catch (e) {}
 }
 
-function showError(msg) { document.getElementById('errorMsg').textContent=msg; showPhase('error'); }
 </script>
 </body>
 </html>

@@ -71,8 +71,13 @@ class PPTEngine:
         fmt: str = "ppt169",
         enable_thinking: bool = False,
         progress: Optional[Callable] = None,
+        task_tag: Optional[str] = None,
+        resume_project_path: Optional[str] = None,
     ) -> dict:
         """Steps 1-4: 创建项目 + Strategist 设计规划
+
+        task_tag: 项目目录名后缀（通常传 Web 任务 task_id），便于任务重启后定位项目
+        resume_project_path: 已存在的项目目录；传入时跳过项目初始化，直接重跑 Strategist
 
         Returns:
             {
@@ -89,27 +94,43 @@ class PPTEngine:
         # ── Step 1: 源内容已就绪(由上层处理) ──
         _prog("step1", "Step 1: 源内容已就绪", 5)
 
-        # ── Step 2: 项目初始化 ──
-        _prog("step2", "Step 2: 初始化项目...", 8)
-        project_name = f"{topic[:30].replace(' ', '_')}_{uuid.uuid4().hex[:6]}"
-        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-        result = _run_script(
-            [sys.executable, str(SCRIPTS_DIR / "project_manager.py"), "init", project_name, "--format", fmt, "--dir", str(PROJECTS_DIR)],
-            timeout=30,
-        )
-        actual_name = project_name
-        for line in result.splitlines():
-            if "Project created:" in line or "[OK] Project initialized:" in line:
-                # 兼容 Linux('projects/name') 与 Windows('projects\name') 输出
-                actual_name = re.split(r"[\\/]", line.strip())[-1]
-                break
-        project_path = PROJECTS_DIR / actual_name
+        # ── Step 2: 项目初始化 / 恢复已有项目 ──
+        resume_path = Path(resume_project_path) if resume_project_path else None
+        if resume_path and resume_path.is_dir():
+            project_path = resume_path
+            actual_name = project_path.name
+            _prog("step2", f"Step 2: 恢复已有项目 {actual_name}", 8)
+            sources_dir = project_path / "sources"
+            sources_dir.mkdir(exist_ok=True)
+            source_file = sources_dir / "source.md"
+            if not source_file.exists() or not source_file.read_text(encoding="utf-8", errors="replace").strip():
+                source_file.write_text(source_text, encoding="utf-8")
+            _prog("step2", f"项目已恢复: {actual_name}", 10)
+        else:
+            _prog("step2", "Step 2: 初始化项目...", 8)
+            # 项目目录名带上 Web task_id，服务重启后可按任务 ID 定位项目
+            safe_topic = re.sub(r'[\\/:*?"<>|\s]+', "_", (topic or "").strip())[:30].strip("._")
+            if not safe_topic:
+                safe_topic = "ppt"
+            project_name = f"{safe_topic}_{task_tag or uuid.uuid4().hex[:6]}"
+            PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+            result = _run_script(
+                [sys.executable, str(SCRIPTS_DIR / "project_manager.py"), "init", project_name, "--format", fmt, "--dir", str(PROJECTS_DIR)],
+                timeout=30,
+            )
+            actual_name = project_name
+            for line in result.splitlines():
+                if "Project created:" in line or "[OK] Project initialized:" in line:
+                    # 兼容 Linux('projects/name') 与 Windows('projects\name') 输出
+                    actual_name = re.split(r"[\\/]", line.strip())[-1]
+                    break
+            project_path = PROJECTS_DIR / actual_name
 
-        # 写入源内容
-        sources_dir = project_path / "sources"
-        sources_dir.mkdir(exist_ok=True)
-        (sources_dir / "source.md").write_text(source_text, encoding="utf-8")
-        _prog("step2", f"项目已创建: {actual_name}", 10)
+            # 写入源内容
+            sources_dir = project_path / "sources"
+            sources_dir.mkdir(exist_ok=True)
+            (sources_dir / "source.md").write_text(source_text, encoding="utf-8")
+            _prog("step2", f"项目已创建: {actual_name}", 10)
 
         # ── Step 3: 模板选项(默认跳过, free design) ──
         _prog("step3", "Step 3: 使用自由设计模式", 12)
@@ -210,6 +231,7 @@ class PPTEngine:
         page_plan: Optional[list[dict]] = None,
         enable_thinking: bool = False,
         progress: Optional[Callable] = None,
+        resume: bool = False,
     ) -> Path:
         """Steps 5-7: Executor SVG生成 + 后处理 + 导出
 
@@ -217,6 +239,7 @@ class PPTEngine:
             project_path_str: 项目路径
             spec_lock: spec_lock.md 内容(可能经过用户修改后重新生成)
             page_plan: 用户确认的页面规划（优先于spec_lock中解析）
+            resume: 续跑模式，跳过 svg_output 中已生成完整的页面
         Returns:
             生成的 .pptx 文件路径
         """
@@ -270,8 +293,29 @@ class PPTEngine:
         svg_output_dir.mkdir(exist_ok=True)
         total_pages = len(pages)
 
+        generated_pages = 0
+        skipped_pages = 0
+        if resume:
+            _prog("step6", "续跑模式: 检查已生成的页面...", 30)
+
         for i, page_info in enumerate(pages):
-            pct = 30 + int((i / total_pages) * 45)
+            pct = 30 + int(((i + 1) / total_pages) * 45)
+            fname = self._resolve_page_filename(page_info, i)
+            target = svg_output_dir / fname
+
+            # 续跑：已存在且看起来完整的 SVG 直接保留，避免覆盖用户可能已编辑/标注的页面
+            if resume and target.exists():
+                try:
+                    existing = target.read_text(encoding="utf-8", errors="replace")
+                    if len(existing) >= 200 and "</svg>" in existing[-4096:].lower():
+                        skipped_pages += 1
+                        logger.info("续跑: 已保留第 %d/%d 页 %s", i + 1, total_pages, fname)
+                        _prog("step6", f"续跑: 已保留第 {i+1}/{total_pages} 页", pct)
+                        continue
+                    logger.warning("续跑: 第 %d 页文件不完整，将重新生成: %s", i + 1, fname)
+                except OSError as e:
+                    logger.warning("续跑: 读取第 %d 页失败，将重新生成: %s", i + 1, e)
+
             _prog("step6", f"正在生成第 {i+1}/{total_pages} 页: {page_info.get('title', '')}", pct)
             svg_content = self._generate_svg_page(
                 spec_lock, page_info, i, total_pages, source_text, enable_thinking=enable_thinking
@@ -293,18 +337,6 @@ class PPTEngine:
                     svg_content = svg_content[:g_match.end()] + "\n  " + bg_rect + svg_content[g_match.end():]
                     logger.info("已为第 %d 页自动补充背景: %s", i+1, bg_color)
 
-            fname = page_info.get("filename", f"slide_{i+1:02d}.svg")
-            # 安全校验：文件名不能含 JSON 残片、路径分隔符、引号等非法字符
-            if not fname or any(c in fname for c in '{}":\\/') or not fname.replace('_','').replace('-','').replace('.','').replace(' ','').isalnum():
-                fname = f"slide_{int(page_info.get('page_num', i+1)):02d}.svg"
-                logger.warning("非法文件名已修正: %s → %s", page_info.get('filename',''), fname)
-            if not fname.endswith(".svg"):
-                fname += ".svg"
-            # 强制在文件名前加零填充序号，确保排序正确: 01_cover.svg, 02_summary.svg ...
-            fname_no_ext = fname[:-4]  # 去掉 .svg
-            # 如果已经有前导 NN_ 则跳过
-            if not re.match(r'^\d{2}_', fname_no_ext):
-                fname = f"{i+1:02d}_{fname_no_ext}.svg"
             # ── SVG 修复 (弱模型常见错误) ──
             svg_content = self._fix_svg(svg_content)
 
@@ -316,14 +348,19 @@ class PPTEngine:
                 logger.debug("第 %d 页SVG XML合法", i+1)
             except ET.ParseError as e:
                 logger.warning("第 %d 页SVG XML仍有小问题(已由_fix_svg预处理): %s — 强制写入, legacy模式兜底", i+1, e)
-            (svg_output_dir / fname).write_text(svg_content, encoding="utf-8")
+            target.write_text(svg_content, encoding="utf-8")
+            generated_pages += 1
 
-        _prog("step6", f"全部 {total_pages} 页SVG生成完成", 76)
+        _prog("step6", f"全部 {total_pages} 页SVG完成（本次生成 {generated_pages} 页，续用 {skipped_pages} 页）", 76)
 
         # ── Step 6 续: 演讲备注 ──
-        notes_md = self._generate_notes(spec_lock, source_text, project_path.name, enable_thinking=enable_thinking)
-        (project_path / "notes").mkdir(exist_ok=True)
-        (project_path / "notes" / "total.md").write_text(notes_md, encoding="utf-8")
+        notes_path = project_path / "notes" / "total.md"
+        if resume and total_pages > 0 and skipped_pages == total_pages and notes_path.exists() and notes_path.stat().st_size > 0:
+            _prog("step6", "续跑: 演讲备注已存在，跳过重新生成", 76)
+        else:
+            notes_md = self._generate_notes(spec_lock, source_text, project_path.name, enable_thinking=enable_thinking)
+            (project_path / "notes").mkdir(exist_ok=True)
+            notes_path.write_text(notes_md, encoding="utf-8")
 
         # ── Step 7: 后处理 + 导出 ──
         _prog("step7", "Step 7: 后处理...", 78)
@@ -400,6 +437,27 @@ class PPTEngine:
             return all_pptx[0]
 
         raise RuntimeError(f"PPTX 导出失败: 未找到输出文件 (搜索路径: {project_path})")
+
+    @staticmethod
+    def _resolve_page_filename(page_info: dict, index: int) -> str:
+        """与执行阶段一致地解析页面 SVG 文件名（续跑时必须保持同一规则）"""
+        fname = page_info.get("filename", f"slide_{index+1:02d}.svg")
+        # 安全校验：文件名不能含 JSON 残片、路径分隔符、引号等非法字符
+        if not fname or any(c in fname for c in '{}":\\/') or not fname.replace('_','').replace('-','').replace('.','').replace(' ','').isalnum():
+            try:
+                page_no = int(page_info.get("page_num", index + 1))
+            except (TypeError, ValueError):
+                page_no = index + 1
+            fname = f"slide_{page_no:02d}.svg"
+            logger.warning("非法文件名已修正: %s → %s", page_info.get('filename',''), fname)
+        if not fname.endswith(".svg"):
+            fname += ".svg"
+        # 强制在文件名前加零填充序号，确保排序正确: 01_cover.svg, 02_summary.svg ...
+        fname_no_ext = fname[:-4]  # 去掉 .svg
+        # 如果已经有前导 NN_ 则跳过
+        if not re.match(r'^\d{2}_', fname_no_ext):
+            fname = f"{index+1:02d}_{fname_no_ext}.svg"
+        return fname
 
     def generate(
         self,

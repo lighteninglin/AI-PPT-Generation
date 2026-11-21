@@ -3,3 +3,5 @@
 dist/data/
 dist-arm64/
 __pycache__/
+projects/.task_states/
+.zcode/

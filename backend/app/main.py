@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -40,66 +41,377 @@ tasks: dict[str, dict] = {}
 ws_connections: dict[str, list[WebSocket]] = {}
 
 # ── 任务持久化 ──
-def _save_task_meta(task_id: str, task: dict):
-    """将任务元信息持久化到项目目录，容器重启后可恢复"""
-    try:
-        project_path = None
-        pd = task.get("preview_data") or {}
-        project_path = pd.get("project_path")
-        if not project_path:
-            rp = task.get("result_path")
-            if rp:
-                project_path = str(Path(rp).parent.parent)
-        if project_path and Path(project_path).is_dir():
-            meta = {
-                "task_id": task_id,
-                "status": task.get("status", ""),
-                "topic": task.get("topic", ""),
-                "result_path": task.get("result_path"),
-                "project_path": project_path,
-                "last_active": datetime.now().isoformat(),
-            }
-            (Path(project_path) / "task_meta.json").write_text(
-                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
-            )
-    except Exception as e:
-        logger.warning("保存task_meta失败: %s", e)
+STATE_DIR = PROJECTS_DIR / ".task_states"
+STATE_SCHEMA_VERSION = 1
+_state_lock = threading.RLock()
 
-def _restore_tasks():
-    """启动时从 projects/ 目录恢复已完成的任务到内存"""
-    restored = 0
-    for projects_root in [PROJECTS_DIR, Path("/app/projects")]:
-        if not projects_root.is_dir():
+_PERSIST_KEYS = (
+    "id", "status", "progress", "stage", "message", "topic",
+    "result_path", "project_path", "created_at", "last_active",
+    "preview_payload", "preview_data", "execution", "replan",
+)
+
+
+def _projects_roots() -> list[Path]:
+    """返回所有可能存放项目的根目录（去重、只保留已存在的）"""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in (PROJECTS_DIR, PROJECTS_DIR / "projects", Path("/app/projects")):
+        try:
+            if not candidate.is_dir():
+                continue
+            key = str(candidate.resolve())
+        except OSError:
             continue
-        for d in projects_root.iterdir():
-            if not d.is_dir():
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(candidate)
+    return roots
+
+
+def _state_path(task_id: str) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id))[:128] or "task"
+    return STATE_DIR / f"{safe_id}.json"
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """原子写入 JSON，避免进程中断时留下半个文件"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _task_project_path(task: dict) -> Optional[Path]:
+    """从任务字段推导项目目录，优先 preview_data.project_path"""
+    pd = task.get("preview_data") or {}
+    for candidate in (task.get("project_path"), pd.get("project_path")):
+        if candidate:
+            p = Path(candidate)
+            if p.is_dir():
+                return p
+    rp = task.get("result_path")
+    if rp:
+        p = Path(rp)
+        for parent in p.parents:
+            if (parent / "task_meta.json").exists():
+                return parent
+            # 无 task_meta 时用项目结构识别根目录（避免把 backup/ 子目录当项目根）
+            if (parent / "svg_output").is_dir() and (parent / "sources").is_dir():
+                return parent
+        if p.parent.parent.is_dir():
+            return p.parent.parent
+    return None
+
+
+def _find_project_dir_for_task(task_id: str, hint: Optional[str] = None) -> Optional[Path]:
+    """按 task_id 扫描项目目录；兼容容器迁移后绝对路径失效的情况"""
+    if hint:
+        p = Path(hint)
+        if p.is_dir():
+            return p
+    if not task_id:
+        return None
+    candidates: list[Path] = []
+    for root in _projects_roots():
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for d in children:
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            meta_path = d / "task_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if meta.get("task_id") == task_id:
+                        return d
+                except Exception:
+                    pass
+            if task_id in d.name:
+                candidates.append(d)
+    if candidates:
+        candidates.sort(
+            key=lambda d: ((d / "sources" / "source.md").exists(), d.stat().st_mtime),
+            reverse=True,
+        )
+        return candidates[0]
+    return None
+
+
+def _task_state_payload(task_id: str, task: dict, touch_last_active: bool = True) -> dict:
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    state: dict = {"schema": STATE_SCHEMA_VERSION, "id": task_id}
+    for key in _PERSIST_KEYS:
+        if key in task:
+            state[key] = copy.deepcopy(task[key])
+    state["last_active"] = (
+        now_iso if touch_last_active
+        else (task.get("last_active") or task.get("created_at") or now_iso)
+    )
+    if not state.get("created_at"):
+        state["created_at"] = task.get("created_at") or now_iso
+
+    pd = state.get("preview_data")
+    if isinstance(pd, dict):
+        # 执行/完成后不再需要原文；状态文件保持轻量，也避免反复写大文本
+        if state.get("status") in ("executing", "done"):
+            pd.pop("source_text", None)
+        if not pd.get("project_path") and state.get("project_path"):
+            pd["project_path"] = state["project_path"]
+    return state
+
+
+def _persist_task(
+    task_id: str,
+    task: Optional[dict] = None,
+    throttle_seconds: float = 0,
+    touch_last_active: bool = True,
+) -> None:
+    """持久化任务完整状态；throttle_seconds > 0 时用于高频进度回调节流"""
+    task = task if task is not None else tasks.get(task_id)
+    if not task:
+        return
+    now_ts = time.time()
+    last_write = float(task.get("_last_state_write") or 0)
+    if throttle_seconds and last_write and (now_ts - last_write) < throttle_seconds:
+        return
+
+    try:
+        with _state_lock:
+            state = _task_state_payload(task_id, task, touch_last_active=touch_last_active)
+            _atomic_write_json(_state_path(task_id), state)
+
+            project_dir = _task_project_path(task)
+            if project_dir:
+                meta_path = project_dir / "task_meta.json"
+                meta: dict = {}
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        meta = {}
+                meta.update({
+                    "task_id": task_id,
+                    "status": task.get("status", ""),
+                    "topic": task.get("topic", ""),
+                    "result_path": task.get("result_path"),
+                    "project_path": str(project_dir),
+                    "last_active": state["last_active"],
+                })
+                _atomic_write_json(meta_path, meta)
+            if touch_last_active:
+                task["last_active"] = state["last_active"]
+            task["_last_state_write"] = now_ts
+    except Exception as e:
+        # 持久化失败不应中断正在进行的生成任务
+        logger.warning("持久化任务状态失败 %s: %s", task_id, e)
+
+
+def _mark_task_error(task_id: str, message: str, progress: Optional[int] = None) -> None:
+    task = tasks.get(task_id)
+    if not task:
+        return
+    task["status"] = "error"
+    task["message"] = message
+    if progress is not None:
+        task["progress"] = progress
+    _persist_task(task_id)
+
+
+def _resolve_preview_payload(task_id: str, task: dict) -> Optional[dict]:
+    """恢复预览所需输入：优先状态里的 payload，其次项目 sources/source.md"""
+    payload = copy.deepcopy(task.get("preview_payload") or {})
+    project_dir = _task_project_path(task) or _find_project_dir_for_task(task_id)
+    if project_dir:
+        src = project_dir / "sources" / "source.md"
+        if src.exists() and not payload.get("source_text"):
+            payload["source_text"] = src.read_text(encoding="utf-8", errors="replace")
+        payload.setdefault("topic", task.get("topic") or project_dir.name.split("_")[0])
+        task["project_path"] = str(project_dir)
+    if not payload.get("source_text"):
+        return None
+    payload.setdefault("topic", task.get("topic", ""))
+    payload.setdefault("source_type", "text")
+    payload.setdefault("format", "ppt169")
+    payload.setdefault("enable_thinking", False)
+    return payload
+
+
+def _restore_tasks() -> list[tuple[str, str]]:
+    """启动时从状态文件/旧 task_meta 恢复任务。
+
+    Returns: 需要自动续跑的任务列表 [(kind, task_id)]，kind 为 preview/execute。
+    """
+    restored = 0
+    resume_jobs: list[tuple[str, str]] = []
+    seen_dirs: set[str] = set()
+
+    # 1) 新状态文件（完整状态）
+    if STATE_DIR.is_dir():
+        for state_file in sorted(STATE_DIR.glob("*.json")):
+            try:
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning("恢复状态文件 %s 失败: %s", state_file.name, e)
+                continue
+            tid = state.get("id") or state_file.stem
+            if not tid or tid in tasks:
+                continue
+
+            task: dict = {"id": tid}
+            for key in _PERSIST_KEYS:
+                if key in state:
+                    task[key] = state[key]
+            task.setdefault("status", "error")
+            task.setdefault("progress", 0)
+            task.setdefault("stage", "")
+            task.setdefault("message", "")
+            task.setdefault("topic", "")
+            task.setdefault("result_path", None)
+            task.setdefault("preview_payload", None)
+            task.setdefault("preview_data", None)
+            task.setdefault("execution", None)
+            task.setdefault("replan", None)
+            task.setdefault("created_at", state.get("created_at")
+                            or datetime.fromtimestamp(state_file.stat().st_mtime).isoformat(timespec="seconds"))
+            task.setdefault("last_active", state.get("last_active"))
+
+            status = task.get("status") or "error"
+            hint = task.get("project_path") or (task.get("preview_data") or {}).get("project_path")
+            project_dir = _find_project_dir_for_task(tid, hint=hint)
+            if project_dir:
+                task["project_path"] = str(project_dir)
+                pd = task.get("preview_data")
+                if isinstance(pd, dict):
+                    pd["project_path"] = str(project_dir)
+                seen_dirs.add(str(project_dir.resolve()))
+
+            # 重启时仍在运行的 replan 无法继续，转为失败态供前端重试
+            replan = task.get("replan")
+            if isinstance(replan, dict) and replan.get("status") == "running":
+                replan.update({
+                    "status": "failed",
+                    "error": "服务重启导致重新规划中断，请重试",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                })
+                task["replan"] = replan
+
+            if status == "awaiting_confirm":
+                pd = task.get("preview_data") or {}
+                if not pd.get("eight_confirmations") or not pd.get("page_plan"):
+                    task["status"] = "error"
+                    task["message"] = "旧任务缺少方案确认数据（升级前未完整持久化），请重新生成设计方案"
+                    task["progress"] = 0
+                elif not project_dir:
+                    task["status"] = "error"
+                    task["message"] = "任务的项目目录不存在，无法继续确认生成"
+                    task["progress"] = 0
+            elif status == "previewing":
+                resume_jobs.append(("preview", tid))
+            elif status == "running":
+                task["status"] = "error"
+                task["message"] = "旧的一步生成任务无法断点续跑，已中断；请重新发起任务"
+                task["progress"] = 0
+            elif status == "executing":
+                if project_dir:
+                    resume_jobs.append(("execute", tid))
+                else:
+                    task["status"] = "error"
+                    task["message"] = "服务重启后项目目录不存在，无法继续生成"
+            elif status == "done":
+                if not task.get("result_path") and not project_dir:
+                    logger.warning("跳过无结果且无项目目录的完成任务: %s", tid)
+                    continue
+            elif status == "error":
+                if not task.get("result_path") and not project_dir:
+                    logger.warning("跳过无项目目录的错误任务: %s", tid)
+                    continue
+
+            tasks[tid] = task
+            _persist_task(tid, touch_last_active=False)
+            restored += 1
+
+    # 2) 旧 task_meta.json 兼容
+    for root in _projects_roots():
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for d in children:
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            try:
+                resolved = str(d.resolve())
+            except OSError:
+                resolved = str(d)
+            if resolved in seen_dirs:
                 continue
             meta_path = d / "task_meta.json"
             if not meta_path.exists():
                 continue
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                tid = meta.get("task_id")
-                if not tid or tid in tasks:
-                    continue
-                # 只恢复已完成/错误状态的任务（进行中的无法恢复）
-                status = meta.get("status", "")
-                if status in ("done", "error", "awaiting_confirm"):
-                    tasks[tid] = {
-                        "id": tid,
-                        "status": status,
-                        "progress": 100 if status == "done" else 0,
-                        "stage": "done" if status == "done" else status,
-                        "message": "任务已恢复(重启后)" if status == "done" else "",
-                        "result_path": meta.get("result_path"),
-                        "topic": meta.get("topic", ""),
-                        "preview_data": {"project_path": meta.get("project_path", str(d))},
-                    }
-                    restored += 1
             except Exception as e:
                 logger.warning("恢复task_meta %s 失败: %s", d.name, e)
+                continue
+            tid = meta.get("task_id") or d.name
+            if not tid or tid in tasks:
+                continue
+
+            status = meta.get("status", "") or "error"
+            preview_data: dict = {"project_path": str(d)}
+            src = d / "sources" / "source.md"
+            if src.exists():
+                try:
+                    preview_data["source_text"] = src.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+            preview_data["topic"] = meta.get("topic", "")
+
+            message = ""
+            if status in ("awaiting_confirm",):
+                # 旧格式只有项目路径，没有八项确认/生效页规划；不能安全地继续确认
+                status = "error"
+                message = "旧任务缺少方案确认数据（升级前未完整持久化），请重新生成设计方案"
+            elif status in ("previewing", "executing", "running"):
+                status = "error"
+                message = "旧任务缺少续跑所需状态，已中断；请重新发起任务"
+            elif status == "done":
+                pass
+            elif status == "error":
+                message = meta.get("message", "") or "任务此前已失败"
+
+            tasks[tid] = {
+                "id": tid,
+                "status": status,
+                "progress": 100 if status == "done" else 0,
+                "stage": "done" if status == "done" else status,
+                "message": message or ("任务已恢复(重启后)" if status == "done" else ""),
+                "result_path": meta.get("result_path"),
+                "topic": meta.get("topic", ""),
+                "project_path": str(d),
+                "preview_payload": None,
+                "preview_data": preview_data,
+                "execution": None,
+                "replan": None,
+                "last_active": meta.get("last_active")
+                or datetime.fromtimestamp(meta_path.stat().st_mtime).isoformat(timespec="seconds"),
+                "created_at": meta.get("created_at"),
+            }
+            seen_dirs.add(resolved)
+            _persist_task(tid, touch_last_active=False)
+            restored += 1
+
     if restored:
         logger.info("从磁盘恢复了 %d 个任务", restored)
+    return resume_jobs
 
 # ── 过期任务清理（7天） ──
 CLEANUP_DAYS = 7
@@ -110,12 +422,23 @@ def _touch_task_meta(project_dir: Path):
     if not meta_path.exists():
         return
     try:
-        raw = meta_path.read_text(encoding="utf-8")
-        meta = json.loads(raw)
-        meta["last_active"] = datetime.now().isoformat()
-        tmp = meta_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(meta_path)  # 原子替换，防半写
+        with _state_lock:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            meta["last_active"] = now_iso
+            _atomic_write_json(meta_path, meta)
+            tid = meta.get("task_id")
+            if tid:
+                state_path = _state_path(tid)
+                if state_path.exists():
+                    try:
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                        state["last_active"] = now_iso
+                        _atomic_write_json(state_path, state)
+                    except Exception:
+                        pass
+                if tid in tasks:
+                    tasks[tid]["last_active"] = now_iso
     except json.JSONDecodeError:
         logger.warning("_touch_task_meta: %s JSON损坏，跳过", meta_path)
     except OSError as e:
@@ -156,7 +479,7 @@ def _cleanup_expired_tasks():
     import shutil
     dirs = list(PROJECTS_DIR.iterdir())
     for d in dirs:
-        if not d.is_dir():
+        if not d.is_dir() or d.name.startswith("."):
             continue
         if not _is_task_project(d):
             continue
@@ -174,9 +497,14 @@ def _cleanup_expired_tasks():
             continue
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            # 跳过正在运行的任务（防止误清理）
-            status = meta.get("status", "")
-            if status in ("running", "pending"):
+            task_id = meta.get("task_id", d.name)
+            live = tasks.get(task_id)
+            # 跳过任何仍在运行/生成中的任务；状态以内存为准，meta 可能滞后
+            if live and live.get("status") in ("previewing", "executing", "running"):
+                skipped_running += 1
+                continue
+            status = live.get("status") if live else meta.get("status", "")
+            if status in ("running", "pending", "previewing", "executing"):
                 skipped_running += 1
                 continue
             last_active = _parse_last_active(meta, d)
@@ -184,8 +512,8 @@ def _cleanup_expired_tasks():
                 logger.warning("清理: %s 无法解析时间，跳过", d.name)
                 continue
             if last_active < cutoff:
-                task_id = meta.get("task_id", d.name)
                 tasks.pop(task_id, None)
+                _state_path(task_id).unlink(missing_ok=True)
                 try:
                     shutil.rmtree(d)
                 except OSError as e:
@@ -201,15 +529,120 @@ def _cleanup_expired_tasks():
         except Exception as e:
             logger.warning("清理检查失败 %s: %s", d.name, e)
             errors += 1
+
+    # 清理没有对应项目的陈旧状态文件
+    if STATE_DIR.is_dir():
+        for state_file in STATE_DIR.glob("*.json"):
+            try:
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                task_id = state.get("id") or state_file.stem
+                live = tasks.get(task_id)
+                if live and live.get("status") in ("previewing", "executing", "running"):
+                    skipped_running += 1
+                    continue
+                last_str = state.get("last_active", "")
+                try:
+                    last_active = datetime.fromisoformat(last_str) if last_str else None
+                except (ValueError, TypeError):
+                    last_active = None
+                if last_active is None:
+                    last_active = datetime.fromtimestamp(state_file.stat().st_mtime)
+                if last_active < cutoff:
+                    tasks.pop(task_id, None)
+                    state_file.unlink(missing_ok=True)
+                    removed += 1
+                    logger.info("清理过期状态文件: %s", state_file.name)
+            except Exception as e:
+                logger.warning("清理状态文件失败 %s: %s", state_file.name, e)
+                errors += 1
+
+    # 清理崩溃时可能残留的原子写临时文件
+    if STATE_DIR.is_dir():
+        for tmp_file in STATE_DIR.glob("*.tmp"):
+            try:
+                if datetime.fromtimestamp(tmp_file.stat().st_mtime) < cutoff:
+                    tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     if removed or errors:
         logger.info("清理完成: 删除%d个, 跳过运行中%d个, 失败%d个", removed, skipped_running, errors)
     return removed
 
+def _start_resume_jobs(jobs: list[tuple[str, str]]) -> None:
+    """启动时调度自动续跑（预览/逐页生成）"""
+    if not jobs:
+        return
+    cfg = ConfigManager.load()
+    loop = asyncio.get_event_loop()
+    for kind, task_id in jobs:
+        task = tasks.get(task_id)
+        if not task:
+            continue
+        if not cfg.is_configured():
+            _mark_task_error(
+                task_id,
+                "服务重启后无法自动继续：LLM 尚未配置。请配置后重新发起任务。",
+                progress=task.get("progress") or 0,
+            )
+            continue
+
+        project_dir = _task_project_path(task) or _find_project_dir_for_task(task_id)
+        if project_dir:
+            task["project_path"] = str(project_dir)
+
+        if kind == "preview":
+            payload_dict = _resolve_preview_payload(task_id, task)
+            if not payload_dict:
+                _mark_task_error(task_id, "服务重启后无法恢复设计方案：缺少源内容")
+                continue
+            task["status"] = "previewing"
+            task["stage"] = "restore"
+            task["message"] = "服务重启，正在恢复设计方案..."
+            task["progress"] = max(int(task.get("progress") or 0), 5)
+            task["replan"] = None
+            _persist_task(task_id)
+            try:
+                payload = PreviewPayload(**payload_dict)
+            except Exception as e:
+                _mark_task_error(task_id, f"服务重启后无法恢复设计方案：{e}")
+                continue
+            loop.create_task(
+                _run_preview(
+                    task_id, cfg, payload,
+                    resume_project_path=str(project_dir) if project_dir else None,
+                )
+            )
+
+        elif kind == "execute":
+            pd = task.get("preview_data") or {}
+            execution = task.get("execution") or {}
+            if not project_dir:
+                _mark_task_error(task_id, "服务重启后项目目录不存在，无法继续生成")
+                continue
+            if not execution and not (pd.get("spec_lock") and (pd.get("page_plan") or pd.get("replanned_pages"))):
+                _mark_task_error(task_id, "服务重启后缺少生成所需的方案数据，无法继续生成")
+                continue
+            task["status"] = "executing"
+            task["stage"] = "restore"
+            task["message"] = "服务重启，正在继续生成未完成页面..."
+            task["progress"] = max(int(task.get("progress") or 0), 25)
+            _persist_task(task_id)
+            payload = ConfirmPayload(
+                task_id=task_id,
+                confirmations=copy.deepcopy(execution.get("confirmations") or pd.get("eight_confirmations") or {}),
+                spec_lock=execution.get("spec_lock"),
+                enable_thinking=bool(execution.get("enable_thinking", False)),
+            )
+            loop.create_task(_run_execute(task_id, payload, resume=True))
+
+
 @app.on_event("startup")
 def _on_startup():
-    _restore_tasks()
+    resume_jobs = _restore_tasks()
     _cleanup_expired_tasks()
     logger.info("启动完成, 内存中 %d 个任务", len(tasks))
+    _start_resume_jobs(resume_jobs)
 
     # 每小时执行一次清理（带异常保护，防止协程崩溃）
     async def _periodic_cleanup():
@@ -313,8 +746,15 @@ async def start_preview(payload: PreviewPayload):
         "message": "正在生成设计方案...",
         "result_path": None,
         "topic": payload.topic,
+        "project_path": None,
+        "preview_payload": payload.model_dump(),
         "preview_data": None,  # 待填充
+        "execution": None,
+        "replan": None,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "last_active": datetime.now().isoformat(timespec="seconds"),
     }
+    _persist_task(task_id)
 
     asyncio.create_task(_run_preview(task_id, cfg, payload))
     return {"task_id": task_id}
@@ -332,54 +772,111 @@ async def replan_pages(payload: ReplanPayload):
     task = tasks.get(payload.task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    if task.get("status") != "awaiting_confirm":
+        raise HTTPException(400, "任务当前不在待确认状态，无法重新规划")
     pd = task.get("preview_data")
     if not pd:
         raise HTTPException(400, "无预览数据")
 
-    # 用户把页数改回原始规划时，直接清除 replanned_pages，
-    # 保证确认生成时使用的页面与前端右侧大纲一致，且无需再调用 LLM。
+    running = task.get("replan") or {}
+    if isinstance(running, dict) and running.get("status") == "running":
+        raise HTTPException(409, "正在重新规划中，请稍候")
+
     original_plan = pd.get("page_plan") or []
-    if original_plan and payload.target_pages == len(original_plan):
-        pd.pop("replanned_pages", None)
-        cf = pd.get("eight_confirmations", {})
-        pc = cf.get("page_count", {})
-        pc["recommended"] = payload.target_pages
-        cf["page_count"] = pc
-        pd["eight_confirmations"] = cf
-        task["preview_data"] = pd
-        logger.info("页数改回原始规划 %d 页，已清除 replanned_pages", payload.target_pages)
-        return {"page_plan": original_plan, "restored": True}
+    target_pages = max(1, min(50, int(payload.target_pages)))
+    mode = "restore" if (original_plan and target_pages == len(original_plan)) else "plan"
+    task["replan"] = {
+        "status": "running",
+        "mode": mode,
+        "target": target_pages,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _persist_task(payload.task_id)
 
-    cfg = ConfigManager.load()
-    engine = PPTEngine(cfg)
-    loop = asyncio.get_event_loop()
+    try:
+        # 用户把页数改回原始规划时，直接清除 replanned_pages，
+        # 保证确认生成时使用的页面与前端右侧大纲一致，且无需再调用 LLM。
+        if mode == "restore":
+            pd.pop("replanned_pages", None)
+            cf = pd.get("eight_confirmations", {})
+            pc = cf.get("page_count", {})
+            pc["recommended"] = target_pages
+            cf["page_count"] = pc
+            pd["eight_confirmations"] = cf
+            task["preview_data"] = pd
+            task["replan"] = None
+            _persist_task(payload.task_id)
+            logger.info("页数改回原始规划 %d 页，已清除 replanned_pages", target_pages)
+            return {"page_plan": original_plan, "restored": True}
 
-    new_pages = await loop.run_in_executor(
-        None,
-        lambda: engine.replan_page_plan(
-            source_text=pd.get("source_text", ""),
-            topic=pd.get("topic", task.get("topic", "")),
-            spec_lock=pd.get("spec_lock", ""),
-            target_pages=payload.target_pages,
-            enable_thinking=payload.enable_thinking,
+        cfg = ConfigManager.load()
+        if not cfg.is_configured():
+            raise HTTPException(400, "请先配置 LLM API Key")
+        engine = PPTEngine(cfg)
+        loop = asyncio.get_event_loop()
+
+        new_pages = await loop.run_in_executor(
+            None,
+            lambda: engine.replan_page_plan(
+                source_text=pd.get("source_text", ""),
+                topic=pd.get("topic", task.get("topic", "")),
+                spec_lock=pd.get("spec_lock", ""),
+                target_pages=target_pages,
+                enable_thinking=payload.enable_thinking,
+            )
         )
-    )
 
-    if new_pages:
+        new_pages = new_pages or []
+        if not new_pages:
+            raise RuntimeError("AI 未返回页面规划，请重试")
+
         pd["replanned_pages"] = new_pages  # 存到独立key，不覆盖原始page_plan
         # 同步更新 eight_confirmations 的 page_count
         cf = pd.get("eight_confirmations", {})
         pc = cf.get("page_count", {})
-        pc["recommended"] = payload.target_pages
-        if pc.get("min", 0) > payload.target_pages:
-            pc["min"] = payload.target_pages
-        if pc.get("max", 0) < payload.target_pages:
-            pc["max"] = payload.target_pages
+        pc["recommended"] = target_pages
+        if pc.get("min", 0) > target_pages:
+            pc["min"] = target_pages
+        if pc.get("max", 0) < target_pages:
+            pc["max"] = target_pages
         cf["page_count"] = pc
         pd["eight_confirmations"] = cf
         task["preview_data"] = pd
+        task["replan"] = None
+        _persist_task(payload.task_id)
+        return {"page_plan": new_pages}
 
-    return {"page_plan": new_pages}
+    except HTTPException as e:
+        task["replan"] = {
+            "status": "failed",
+            "mode": mode,
+            "target": target_pages,
+            "error": e.detail if isinstance(e.detail, str) else "重新规划失败",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _persist_task(payload.task_id)
+        raise
+    except Exception as e:
+        logger.exception("重新规划任务 %s 失败", payload.task_id)
+        task["replan"] = {
+            "status": "failed",
+            "mode": mode,
+            "target": target_pages,
+            "error": f"重新规划失败: {e}",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _persist_task(payload.task_id)
+        raise HTTPException(500, f"重新规划失败: {e}")
+    finally:
+        current = task.get("replan")
+        if isinstance(current, dict) and current.get("status") == "running":
+            current.update({
+                "status": "failed",
+                "error": "重新规划被中断，请重试",
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            task["replan"] = current
+            _persist_task(payload.task_id)
 
 
 @app.post("/api/generate/confirm")
@@ -390,12 +887,52 @@ async def confirm_and_execute(payload: ConfirmPayload):
         raise HTTPException(404, "任务不存在")
     if task["status"] != "awaiting_confirm":
         raise HTTPException(400, f"任务状态不对: {task['status']}，需要先完成设计预览")
+    replan = task.get("replan") or {}
+    if isinstance(replan, dict) and replan.get("status") == "running":
+        raise HTTPException(409, "页面规划仍在生成中，请等待完成后再确认")
 
     task["status"] = "executing"
+    task["stage"] = "step5"
     task["message"] = "正在生成PPT..."
+    task["replan"] = None
+    task["execution"] = {
+        "confirmations": copy.deepcopy(payload.confirmations),
+        "requested_spec_lock": payload.spec_lock,
+        "enable_thinking": payload.enable_thinking,
+        "prepared": False,
+        "requested_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _persist_task(payload.task_id)
 
     asyncio.create_task(_run_execute(payload.task_id, payload))
     return {"task_id": payload.task_id}
+
+
+def _task_public(task_id: str, task: dict) -> dict:
+    """任务轻量投影：轮询用，不含完整 preview_data / 服务器绝对路径"""
+    pd = task.get("preview_data") or {}
+    replan = task.get("replan")
+    return {
+        "id": task_id,
+        "status": task.get("status", ""),
+        "progress": task.get("progress", 0),
+        "stage": task.get("stage", ""),
+        "message": task.get("message", ""),
+        "topic": task.get("topic", ""),
+        "created_at": task.get("created_at"),
+        "last_active": task.get("last_active"),
+        "replan": copy.deepcopy(replan) if isinstance(replan, dict) else None,
+        "has_preview": bool(pd),
+    }
+
+
+@app.get("/api/tasks/recent")
+def recent_tasks(limit: int = 8):
+    """最近的服务器任务，供页面换浏览器/清缓存后继续"""
+    limit = max(1, min(20, int(limit)))
+    items = [_task_public(tid, t) for tid, t in tasks.items() if t]
+    items.sort(key=lambda t: (t.get("last_active") or t.get("created_at") or ""), reverse=True)
+    return {"tasks": items[:limit]}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -403,7 +940,39 @@ def get_task(task_id: str):
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
-    return {"id": task_id, **task}
+    return _task_public(task_id, task)
+
+
+@app.get("/api/tasks/{task_id}/preview")
+def get_task_preview(task_id: str):
+    """返回确认/恢复页面需要的方案数据"""
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    pd = task.get("preview_data") or {}
+    if not pd:
+        raise HTTPException(404, "该任务没有可恢复的方案数据")
+
+    project_dir = _task_project_path(task)
+    source_text = pd.get("source_text") or ""
+    if not source_text and project_dir:
+        src = project_dir / "sources" / "source.md"
+        if src.exists():
+            try:
+                source_text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = ""
+
+    return {
+        "preview_data": {
+            "project_path": str(project_dir) if project_dir else pd.get("project_path"),
+            "eight_confirmations": pd.get("eight_confirmations") or {},
+            "page_plan": pd.get("page_plan") or [],
+            "replanned_pages": pd.get("replanned_pages") or None,
+            "source_text": source_text,
+            "topic": pd.get("topic") or task.get("topic", ""),
+        }
+    }
 
 
 @app.get("/api/download/{task_id}")
@@ -1062,8 +1631,10 @@ async def save_slide(task_id: str, payload: SVGEditPayload):
     all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
 
     if all_pptx:
-        task = tasks.get(task_id, {})
-        task["result_path"] = str(all_pptx[0])
+        task = tasks.get(task_id)
+        if task:
+            task["result_path"] = str(all_pptx[0])
+            _persist_task(task_id)
 
     return {"ok": True, "saved": safe_name}
 
@@ -1119,8 +1690,10 @@ async def rebuild_pptx(task_id: str):
     all_pptx = sorted(list(set(all_pptx)), key=lambda f: f.stat().st_mtime, reverse=True)
 
     if all_pptx:
-        task = tasks.get(task_id, {})
-        task["result_path"] = str(all_pptx[0])
+        task = tasks.get(task_id)
+        if task:
+            task["result_path"] = str(all_pptx[0])
+            _persist_task(task_id)
 
     return {"ok": True, "message": "PPTX 重新导出完成"}
 
@@ -1162,9 +1735,15 @@ def _notify_ws(task_id: str, data: dict, loop=None):
             pass
 
 
-async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
+async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload, resume_project_path: Optional[str] = None):
     """Steps 1-4: 生成设计方案"""
-    task = tasks[task_id]
+    task = tasks.get(task_id)
+    if not task:
+        return
+    task["status"] = "previewing"
+    task.setdefault("message", "正在生成设计方案...")
+    _persist_task(task_id)
+
     try:
         engine = PPTEngine(cfg)
 
@@ -1174,6 +1753,18 @@ async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
             task["stage"] = stage
             task["message"] = msg
             task["progress"] = pct
+            # 项目目录创建后立刻关联 task_id；确认源文已落盘后再移除状态里的大原文
+            if stage == "step2":
+                pp = task.get("preview_payload")
+                if isinstance(pp, dict) and pp.get("source_text"):
+                    found = _find_project_dir_for_task(task_id, hint=resume_project_path)
+                    if found:
+                        task["project_path"] = str(found)
+                        src_file = found / "sources" / "source.md"
+                        if src_file.exists() and src_file.stat().st_size > 0:
+                            pp.pop("source_text", None)
+                            task["preview_payload"] = pp
+            _persist_task(task_id, throttle_seconds=8)
             _notify_ws(task_id, {"stage": stage, "message": msg, "progress": pct}, loop=loop)
 
         preview_data = await loop.run_in_executor(
@@ -1184,87 +1775,160 @@ async def _run_preview(task_id: str, cfg: LLMConfig, payload: PreviewPayload):
                 fmt=payload.format,
                 enable_thinking=payload.enable_thinking,
                 progress=on_progress,
+                task_tag=task_id,
+                resume_project_path=resume_project_path,
             )
         )
 
+        task["project_path"] = preview_data.get("project_path")
+        pp = task.get("preview_payload")
+        if isinstance(pp, dict):
+            pp.pop("source_text", None)
+            task["preview_payload"] = pp
         task["status"] = "awaiting_confirm"
+        task["stage"] = "awaiting_confirm"
         task["message"] = "设计方案已生成，请确认"
         task["progress"] = 25
         task["preview_data"] = preview_data
-        _save_task_meta(task_id, task)
+        _persist_task(task_id)
         _notify_ws(task_id, {"stage": "awaiting_confirm", "message": "设计方案已生成，请确认", "progress": 25, "status": "awaiting_confirm"}, loop=loop)
 
     except Exception as e:
         logger.exception("Preview 任务 %s 失败", task_id)
         task["status"] = "error"
+        task["stage"] = "error"
         task["message"] = f"设计方案生成失败: {e}"
         task["progress"] = 0
-        _save_task_meta(task_id, task)
+        _persist_task(task_id)
         _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
 
 
-async def _run_execute(task_id: str, payload: ConfirmPayload):
-    """Steps 5-7: 执行生成"""
-    task = tasks[task_id]
-    preview_data = task.get("preview_data", {})
+async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, resume: bool = False):
+    """Steps 5-7: 执行生成（resume=True 时跳过已完成的页面）"""
+    task = tasks.get(task_id)
+    if not task:
+        return
+    preview_data = task.get("preview_data") or {}
+    execution = task.get("execution") or {}
 
     try:
         cfg = ConfigManager.load()
+        if not cfg.is_configured():
+            raise RuntimeError("LLM 尚未配置，无法继续生成")
         engine = PPTEngine(cfg)
 
         loop = asyncio.get_event_loop()
 
         def on_progress(stage, msg, pct):
-            # 映射到全局进度 (25-100)
+            # 映射到全局进度 (25-100)；续跑时进度不回退
             global_pct = 25 + int(pct * 0.75)
+            if resume:
+                global_pct = max(global_pct, int(task.get("progress") or 0))
             task["stage"] = stage
             task["message"] = msg
             task["progress"] = global_pct
+            _persist_task(task_id, throttle_seconds=8)
             _notify_ws(task_id, {"stage": stage, "message": msg, "progress": global_pct}, loop=loop)
 
-        project_path = preview_data.get("project_path")
-        spec_lock = payload.spec_lock or preview_data.get("spec_lock", "")
-        confirmations = payload.confirmations
-
-        # 检查用户是否修改了 Eight Confirmations（排除 page_count，它已通过 replan 处理）
-        original_cf = preview_data.get("eight_confirmations", {})
-        # 深拷贝后去掉 page_count 再比较，因为页数变化已由 replan 处理
-        cf_without_pages = copy.deepcopy(confirmations)
-        orig_without_pages = copy.deepcopy(original_cf)
-        cf_without_pages.pop("page_count", None)
-        orig_without_pages.pop("page_count", None)
-        need_regenerate = (cf_without_pages != orig_without_pages)
-        regen_result = None
-
-        # 用户确认后的 page_plan
-        # 策略：如果用户没改过页数(replan没被调用)，始终用 preview 阶段原始解析的 page_plan
-        # 只有用户明确通过 replan API 调整了页数，才使用 replan 的结果
-        replanned_page_plan = preview_data.get("replanned_pages")  # 只有replan API才会设这个key
-
-        if need_regenerate:
-            logger.info("用户修改了 Eight Confirmations, 重新生成 spec_lock")
-            regen_result = await loop.run_in_executor(
-                None,
-                lambda: engine.confirm_and_regenerate(
-                    project_path_str=project_path,
-                    user_modifications=confirmations,
-                    enable_thinking=payload.enable_thinking,
-                    progress=on_progress,
-                )
+        # ── 定位项目目录（兼容状态文件迁移后绝对路径失效） ──
+        project_path = preview_data.get("project_path") or execution.get("project_path") or task.get("project_path")
+        project_dir = Path(project_path) if project_path else None
+        if not project_dir or not project_dir.is_dir():
+            project_dir = _find_project_dir_for_task(
+                task_id, hint=str(project_dir) if project_dir else None
             )
-            spec_lock = regen_result["spec_lock"]
+        if not project_dir:
+            raise RuntimeError("项目目录不存在，无法继续生成")
+        project_path = str(project_dir)
+        task["project_path"] = project_path
+        preview_data["project_path"] = project_path
 
-        # 优先用 replan 结果 > regenerate 结果 > preview 原始
-        if replanned_page_plan:
-            user_page_plan = replanned_page_plan
-            logger.info("使用用户 replan 后的 page_plan (%d 页)", len(replanned_page_plan))
-        elif need_regenerate and regen_result:
-            user_page_plan = regen_result.get("page_plan")
-            preview_data["page_plan"] = user_page_plan
-            logger.info("使用 regenerate 的 page_plan (%d 页)", len(user_page_plan or []))
+        # ── 已 prepare 的计划（重启续跑）直接复用 ──
+        if execution.get("prepared") and (execution.get("spec_lock") or preview_data.get("spec_lock")):
+            spec_lock = execution.get("spec_lock") or preview_data.get("spec_lock", "")
+            user_page_plan = (
+                execution.get("page_plan")
+                or preview_data.get("replanned_pages")
+                or preview_data.get("page_plan")
+                or []
+            )
+            confirmations = execution.get("confirmations") or preview_data.get("eight_confirmations") or {}
+            enable_thinking = bool(execution.get("enable_thinking", False))
+            logger.info("复用已准备的生成计划: %d 页 (resume=%s)", len(user_page_plan), resume)
         else:
-            user_page_plan = preview_data.get("page_plan")
-            logger.info("使用 preview 原始 page_plan (%d 页)", len(user_page_plan or []))
+            # ── 首次 / 重启发生在 prepare 之前：完成参数整理 ──
+            if payload is not None:
+                confirmations = copy.deepcopy(payload.confirmations or {})
+                enable_thinking = bool(payload.enable_thinking)
+                spec_lock = payload.spec_lock or preview_data.get("spec_lock", "")
+            else:
+                confirmations = copy.deepcopy(
+                    execution.get("confirmations")
+                    or preview_data.get("eight_confirmations")
+                    or {}
+                )
+                enable_thinking = bool(execution.get("enable_thinking", False))
+                spec_lock = (
+                    execution.get("requested_spec_lock")
+                    or execution.get("spec_lock")
+                    or preview_data.get("spec_lock", "")
+                )
+
+            # 检查用户是否修改了 Eight Confirmations（排除 page_count，它已通过 replan 处理）
+            original_cf = preview_data.get("eight_confirmations", {}) or {}
+            cf_without_pages = copy.deepcopy(confirmations)
+            orig_without_pages = copy.deepcopy(original_cf)
+            cf_without_pages.pop("page_count", None)
+            orig_without_pages.pop("page_count", None)
+            need_regenerate = (cf_without_pages != orig_without_pages)
+            regen_result = None
+
+            if need_regenerate:
+                logger.info("用户修改了 Eight Confirmations, 重新生成 spec_lock")
+                regen_result = await loop.run_in_executor(
+                    None,
+                    lambda: engine.confirm_and_regenerate(
+                        project_path_str=project_path,
+                        user_modifications=confirmations,
+                        enable_thinking=enable_thinking,
+                        progress=on_progress,
+                    )
+                )
+                spec_lock = regen_result["spec_lock"]
+
+            # 优先用 replan 结果 > regenerate 结果 > preview 原始
+            replanned_page_plan = preview_data.get("replanned_pages")
+            if replanned_page_plan:
+                user_page_plan = replanned_page_plan
+                logger.info("使用用户 replan 后的 page_plan (%d 页)", len(replanned_page_plan))
+            elif need_regenerate and regen_result and regen_result.get("page_plan"):
+                user_page_plan = regen_result["page_plan"]
+                preview_data["page_plan"] = user_page_plan
+                logger.info("使用 regenerate 的 page_plan (%d 页)", len(user_page_plan or []))
+            else:
+                user_page_plan = preview_data.get("page_plan") or []
+                logger.info("使用 preview 原始 page_plan (%d 页)", len(user_page_plan or []))
+
+            task["execution"] = {
+                "confirmations": copy.deepcopy(confirmations),
+                "spec_lock": spec_lock,
+                "page_plan": copy.deepcopy(user_page_plan),
+                "enable_thinking": enable_thinking,
+                "project_path": project_path,
+                "prepared": True,
+                "prepared_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            execution = task["execution"]
+            _persist_task(task_id)
+
+        # 执行阶段不再需要原文；从内存状态移除，避免状态文件/轮询携带大文本
+        if isinstance(preview_data, dict):
+            preview_data.pop("source_text", None)
+        task["preview_data"] = preview_data
+        task["status"] = "executing"
+        task["stage"] = "step5"
+        task["message"] = "正在继续生成未完成页面..." if resume else "正在生成PPT..."
+        _persist_task(task_id)
 
         result_path = await loop.run_in_executor(
             None,
@@ -1272,25 +1936,28 @@ async def _run_execute(task_id: str, payload: ConfirmPayload):
                 project_path_str=project_path,
                 spec_lock=spec_lock,
                 page_plan=user_page_plan,
-                enable_thinking=payload.enable_thinking,
+                enable_thinking=enable_thinking,
                 progress=on_progress,
+                resume=resume,
             )
         )
 
         task["status"] = "done"
+        task["stage"] = "done"
         task["progress"] = 100
         task["message"] = "PPT生成完成!"
         task["result_path"] = str(result_path)
-        _save_task_meta(task_id, task)
+        _persist_task(task_id)
         _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
 
     except Exception as e:
         logger.exception("Execute 任务 %s 失败", task_id)
         task["status"] = "error"
+        task["stage"] = "error"
         task["message"] = f"生成失败: {e}"
-        task["progress"] = 0
-        _save_task_meta(task_id, task)
-        _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
+        task["progress"] = int(task.get("progress") or 0)
+        _persist_task(task_id)
+        _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": task["progress"], "status": "error"}, loop=asyncio.get_event_loop())
 
 
 async def _run_generate(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
@@ -1318,16 +1985,18 @@ async def _run_generate(task_id: str, cfg: LLMConfig, payload: GeneratePayload):
             )
         )
         task["status"] = "done"
+        task["stage"] = "done"
         task["progress"] = 100
         task["message"] = "PPT生成完成!"
         task["result_path"] = str(result_path)
-        _save_task_meta(task_id, task)
+        _persist_task(task_id)
         _notify_ws(task_id, {"stage": "done", "message": "PPT生成完成!", "progress": 100, "status": "done"}, loop=loop)
 
     except Exception as e:
         logger.exception("任务 %s 失败", task_id)
         task["status"] = "error"
+        task["stage"] = "error"
         task["message"] = f"生成失败: {e}"
         task["progress"] = 0
-        _save_task_meta(task_id, task)
+        _persist_task(task_id)
         _notify_ws(task_id, {"stage": "error", "message": task["message"], "progress": 0, "status": "error"}, loop=asyncio.get_event_loop())
