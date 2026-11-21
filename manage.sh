@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════
-# PPT-Web 管理脚本
-# 用法: ./manage.sh {start|stop|restart|status|logs|update}
+# PPT-Web 管理脚本（在部署包解压目录内使用）
+# 用法: ./manage.sh {start|stop|restart|status|logs|update|clean}
 # ══════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -17,15 +17,22 @@ HOST_PORT="${HOST_PORT:-8000}"
 
 # ── 启动 ──
 do_start() {
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo "⚠️  PPT-Web 已在运行中"
+        echo "   访问: http://<服务器IP>:${HOST_PORT}"
+        return 0
+    fi
+
+    # 存在已停止的旧容器时先删除，避免 docker start 继续使用旧镜像
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "⚠️  PPT-Web 已在运行中"
-            return 0
-        fi
-        echo "🔄 重新启动..."
-        docker start "$CONTAINER_NAME"
+        echo "🔄 清理旧容器（确保使用最新镜像）..."
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    echo "🚀 启动 PPT-Web (端口: ${HOST_PORT})..."
+    if docker compose version &>/dev/null 2>&1 && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+        docker compose up -d --force-recreate
     else
-        echo "🚀 启动 PPT-Web (端口: ${HOST_PORT})..."
         docker run -d \
             --name "$CONTAINER_NAME" \
             --restart unless-stopped \
@@ -41,13 +48,14 @@ do_start() {
 
 # ── 停止 ──
 do_stop() {
-    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "⏹  停止 PPT-Web..."
-        docker stop "$CONTAINER_NAME"
-        echo "✅ 已停止"
+    echo "⏹  停止 PPT-Web..."
+    if docker compose version &>/dev/null 2>&1 && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+        docker compose down
     else
-        echo "⚠️  PPT-Web 未在运行"
+        docker stop "$CONTAINER_NAME" 2>/dev/null || true
+        docker rm "$CONTAINER_NAME" 2>/dev/null || true
     fi
+    echo "✅ 已停止"
 }
 
 # ── 重启 ──
@@ -60,14 +68,11 @@ do_restart() {
 # ── 状态 ──
 do_status() {
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        STATUS="✅ 运行中"
-        UPTIME=$(docker inspect --format='{{.State.StartedAt}}' "$CONTAINER_NAME" 2>/dev/null || echo "未知")
-        PORT=$(docker port "$CONTAINER_NAME" 8000 2>/dev/null || echo "未映射")
         echo "═══════════════════════════════════════════"
-        echo "  PPT-Web 状态: ${STATUS}"
-        echo "  启动时间: ${UPTIME}"
-        echo "  端口映射: ${PORT}"
-        echo "  访问地址: http://<服务器IP>:${HOST_PORT}"
+        echo "  ✅ PPT-Web 运行中"
+        docker ps --filter name="$CONTAINER_NAME" \
+            --format "  容器: {{.Names}}\n  镜像: {{.Image}}\n  端口: {{.Ports}}\n  状态: {{.Status}}"
+        echo "  访问: http://<服务器IP>:${HOST_PORT}"
         echo "═══════════════════════════════════════════"
     else
         echo "⚠️  PPT-Web 未运行"
@@ -79,26 +84,27 @@ do_logs() {
     docker logs -f --tail 100 "$CONTAINER_NAME" 2>/dev/null || echo "⚠️  容器不存在"
 }
 
-# ── 更新镜像 ──
+# ── 更新说明 ──
 do_update() {
-    echo "⚠️  离线环境更新：请先在联网机器上重新运行 package.sh"
-    echo "   然后将新的 ppt-web.tar 拷贝过来执行:"
-    echo "   docker load -i ppt-web.tar"
-    echo "   ./manage.sh restart"
+    echo "⚠️  离线环境更新："
+    echo "   1. 在联网机器上重新运行 ./package.sh 生成新的部署包"
+    echo "   2. 把新的 ppt-web-*-deploy.tar.gz 解压到当前目录并覆盖旧镜像 tar"
+    echo "   3. 执行 ./install.sh（会自动 load 并把 ppt-web:latest 指向新镜像）"
+    echo "   4. 执行 ./manage.sh restart"
 }
 
 # ── 清理 ──
 do_clean() {
-    echo "🗑  清理旧容器和数据..."
-    read -p "确认清理所有 PPT-Web 数据？(y/N) " confirm
+    echo "🗑  清理容器（不会删除 ./data 数据目录）..."
+    read -p "确认清理所有 PPT-Web 容器？(y/N) " confirm
     [ "$confirm" = "y" ] || { echo "已取消"; return; }
     do_stop 2>/dev/null || true
-    docker rm "$CONTAINER_NAME" 2>/dev/null || true
-    echo "✅ 清理完成（镜像未删除）"
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    echo "✅ 清理完成（镜像和数据目录保留）"
 }
 
 # ── 入口 ──
-case "${1:-}" in
+case "${1:-status}" in
     start)   do_start   ;;
     stop)    do_stop    ;;
     restart) do_restart ;;
@@ -110,13 +116,5 @@ case "${1:-}" in
         echo "PPT-Web 管理工具"
         echo ""
         echo "用法: $0 {start|stop|restart|status|logs|update|clean}"
-        echo ""
-        echo "  start    启动服务"
-        echo "  stop     停止服务"
-        echo "  restart  重启服务"
-        echo "  status   查看运行状态"
-        echo "  logs     实时查看日志"
-        echo "  update   更新说明(离线)"
-        echo "  clean    清理容器和数据"
         ;;
 esac

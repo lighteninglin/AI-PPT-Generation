@@ -1,9 +1,15 @@
 node_modules
 .git
+.zcode
 *.pyc
 __pycache__
 .env
 *.egg-info
+*.tar
+*.tar.gz
+dist
+dist-arm64
+backend/tests
 projects/*.pptx
 projects/*/exports
 projects/*/svg_output
@@ -12,3 +18,5 @@ projects/*/sources
 projects/*/images
 projects/*/notes
 projects/*/templates
+
+projects/.task_states

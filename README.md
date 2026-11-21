@@ -11,6 +11,8 @@
 - **七步完整流程** — 内容分析 → 策略规划 → 设计规格 → 页面规划 → 八项确认 → SVG 生成 → PPTX 导出
 - **页数智能推荐** — AI 根据内容量自动推荐合适页数，支持手动调整并让 AI 重新规划内容分配
 - **思考模式** — 可按请求启用/禁用 LLM 思考模式（支持 DeepSeek 等模型的 enable_thinking 参数）
+- **断线续接** — 关闭页面、刷新或换浏览器后自动恢复当前任务与确认修改；服务重启后自动续跑已确认的生成任务，跳过 `svg_output/` 中已完成的页面
+- **最近任务** — 首页展示最近 7 天内的任务，可从“最近任务”继续待确认任务或查看已完成结果
 
 ### 📋 八项交互确认
 生成前展示 8 项设计参数供用户确认和调整：
@@ -38,7 +40,7 @@
 ### 📦 部署与运维
 - **Docker 离线部署** — 一键打包为 tar.gz，拷贝到内网服务器即可安装运行
 - **自动健康检查** — 启动后自动验证服务可用性
-- **数据持久化** — 项目文件和配置通过 Docker Volume 持久化，容器重建不丢失
+- **数据持久化** — 项目文件、任务恢复状态（`projects/.task_states/`）和配置通过 Docker Volume 持久化，容器重建后任务可恢复/续跑
 - **服务管理脚本** — start/stop/restart/status/logs 一套命令管全部
 
 ### ⚙️ 兼容性
@@ -73,33 +75,38 @@ python start.py
 ```bash
 cd ppt-web
 chmod +x package.sh
-./package.sh
+./package.sh              # 默认构建 linux/arm64，产物在 dist-arm64/
+# x86_64 服务器使用: ARCH=amd64 ./package.sh
 ```
 
 脚本自动完成：
-1. 构建 Docker 镜像
-2. 导出镜像 + 部署脚本为 `dist/ppt-web-deploy.tar.gz`
-3. 本地自动部署测试，验证服务是否正常
+1. 构建对应架构的 Docker 镜像
+2. 导出镜像 + 部署脚本为 `dist-<arch>/ppt-web-<arch>-deploy.tar.gz`
+3. 校验镜像架构和镜像内代码
+4. 可选 `RUN_INSTALL_TEST=1 ./package.sh` 做就地安装测试
 
 ### 第二步：传输到内网
 
-将 `dist/ppt-web-deploy.tar.gz` 拷贝到目标服务器（U盘、内网传输等）。
+将 `dist-arm64/ppt-web-arm64-deploy.tar.gz` 拷贝到目标服务器（U盘、内网传输等）。
 
-### 第三步：安装（内网服务器上操作）
+### 第三步：安装（内网服务器上操作，解压目录内就地安装）
 
 ```bash
-# 解压
-tar -xzf ppt-web-deploy.tar.gz
+# 解压到独立目录
+mkdir -p ppt-web-deploy
+tar -xzf ppt-web-arm64-deploy.tar.gz -C ppt-web-deploy
 
-# 安装（自动加载镜像、创建目录、生成配置）
-chmod +x install.sh
+# 进入解压目录安装（不会复制到 ~/ppt-web-deploy）
+cd ppt-web-deploy
+chmod +x install.sh manage.sh
 ./install.sh
 ```
 
-安装完成后，修改 LLM API 配置：
+安装会在**当前目录**完成：加载镜像、创建 `.env`、创建 `data/projects` 和 `data/config`。
+
+安装完成后，修改当前目录下的 LLM 配置：
 
 ```bash
-cd ~/ppt-web-deploy
 vi .env
 ```
 
@@ -119,49 +126,48 @@ HOST_PORT=8000
 ### 第四步：启动
 
 ```bash
-cd ~/ppt-web-deploy
+# 仍在解压后的部署目录内
 ./manage.sh start
 ```
 
-浏览器打开 `http://<服务器IP>:8000` 即可使用。
+浏览器打开 `http://<服务器IP>:8000` 即可使用。也可以安装时直接启动：`./install.sh --start`。
 
 ### 日常管理
 
 ```bash
-cd ~/ppt-web-deploy
-
+# 在部署包解压目录内执行
 ./manage.sh start      # 启动服务
 ./manage.sh stop       # 停止服务
 ./manage.sh restart    # 重启服务
 ./manage.sh status     # 查看运行状态
 ./manage.sh logs       # 实时查看日志
-./manage.sh clean      # 清理容器和数据
+./manage.sh clean      # 清理容器（保留 data 数据目录）
 ```
 
 ### 更新版本
 
 1. 在联网机器上重新运行 `./package.sh` 生成新的部署包
-2. 将 `ppt-web-deploy.tar.gz` 传输到内网服务器
-3. 解压后加载新镜像并重启：
+2. 将新的 `ppt-web-arm64-deploy.tar.gz` 传输到内网服务器
+3. 解压覆盖到原部署目录（保留 `.env` 和 `data/`），然后重新安装并重启：
 
 ```bash
-tar -xzf ppt-web-deploy.tar.gz
-docker load -i ppt-web.tar
-cd ~/ppt-web-deploy
-./manage.sh stop
-docker rm ppt-web
-./manage.sh start
+tar -xzf ppt-web-arm64-deploy.tar.gz -C <原部署目录>
+cd <原部署目录>
+./install.sh
+./manage.sh restart
 ```
+
+`install.sh` 会无条件把 `ppt-web:latest` 指向本次加载的新镜像，升级不会继续使用旧 latest。
 
 ### 数据目录
 
 | 路径 | 说明 |
 |------|------|
-| `~/ppt-web-deploy/data/projects/` | 生成的 PPT 项目文件（SVG、PPTX） |
-| `~/ppt-web-deploy/data/config/` | 运行时配置文件 |
-| `~/ppt-web-deploy/.env` | LLM API 和端口配置 |
+| `<部署目录>/data/projects/` | 生成的 PPT 项目文件（SVG、PPTX）和任务恢复状态 |
+| `<部署目录>/data/config/` | 运行时配置文件 |
+| `<部署目录>/.env` | LLM API 和端口配置 |
 
-数据通过 Docker Volume 持久化，容器重建后不丢失。
+数据通过目录挂载持久化，容器重建后不丢失。
 
 ## 使用说明
 

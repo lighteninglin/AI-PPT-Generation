@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   ppt-web:
     image: ppt-web:latest
@@ -12,6 +10,8 @@ services:
       - ./data/config:/root/.ppt-web
     environment:
       - TZ=Asia/Shanghai
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 30s
