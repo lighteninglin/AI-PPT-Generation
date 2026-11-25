@@ -239,7 +239,14 @@ def _resolve_preview_payload(task_id: str, task: dict) -> Optional[dict]:
         return None
     payload.setdefault("topic", task.get("topic", ""))
     payload.setdefault("source_type", "text")
-    payload.setdefault("format", "ppt169")
+    if not payload.get("format"):
+        # 旧状态文件可能缺 format；从项目目录名（..._ppt43_20261125）恢复真实画布
+        inferred = None
+        if project_dir:
+            m = re.search(r"_(ppt169|ppt43|xiaohongshu|moments|story)_", project_dir.name.lower())
+            if m:
+                inferred = m.group(1)
+        payload["format"] = inferred or (task.get("preview_data") or {}).get("format") or "ppt169"
     payload.setdefault("enable_thinking", False)
     return payload
 
@@ -1844,6 +1851,7 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
         preview_data["project_path"] = project_path
 
         # ── 已 prepare 的计划（重启续跑）直接复用 ──
+        fmt_hint = None
         if execution.get("prepared") and (execution.get("spec_lock") or preview_data.get("spec_lock")):
             spec_lock = execution.get("spec_lock") or preview_data.get("spec_lock", "")
             user_page_plan = (
@@ -1854,6 +1862,11 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
             )
             confirmations = execution.get("confirmations") or preview_data.get("eight_confirmations") or {}
             enable_thinking = bool(execution.get("enable_thinking", False))
+            fmt_hint = (
+                execution.get("format")
+                or (confirmations.get("canvas_format") if isinstance(confirmations, dict) else None)
+                or preview_data.get("format")
+            )
             logger.info("复用已准备的生成计划: %d 页 (resume=%s)", len(user_page_plan), resume)
         else:
             # ── 首次 / 重启发生在 prepare 之前：完成参数整理 ──
@@ -1874,6 +1887,12 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
                     or preview_data.get("spec_lock", "")
                 )
 
+            # 用户确认/修改后的画布格式（ppt43 等），执行阶段必须沿用
+            fmt_hint = (
+                confirmations.get("canvas_format")
+                if isinstance(confirmations, dict) else None
+            ) or preview_data.get("format")
+
             # 检查用户是否修改了 Eight Confirmations（排除 page_count，它已通过 replan 处理）
             original_cf = preview_data.get("eight_confirmations", {}) or {}
             cf_without_pages = copy.deepcopy(confirmations)
@@ -1892,9 +1911,11 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
                         user_modifications=confirmations,
                         enable_thinking=enable_thinking,
                         progress=on_progress,
+                        fmt=fmt_hint,
                     )
                 )
                 spec_lock = regen_result["spec_lock"]
+                fmt_hint = regen_result.get("format") or fmt_hint
 
             # 优先用 replan 结果 > regenerate 结果 > preview 原始
             replanned_page_plan = preview_data.get("replanned_pages")
@@ -1914,6 +1935,7 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
                 "spec_lock": spec_lock,
                 "page_plan": copy.deepcopy(user_page_plan),
                 "enable_thinking": enable_thinking,
+                "format": fmt_hint,
                 "project_path": project_path,
                 "prepared": True,
                 "prepared_at": datetime.now().isoformat(timespec="seconds"),
@@ -1925,6 +1947,15 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
         if isinstance(preview_data, dict):
             preview_data.pop("source_text", None)
         task["preview_data"] = preview_data
+
+        # 兜底：旧状态文件可能没有 format 字段
+        if not fmt_hint:
+            fmt_hint = (
+                (confirmations.get("canvas_format") if isinstance(confirmations, dict) else None)
+                or preview_data.get("format")
+                or (task.get("preview_payload") or {}).get("format")
+            )
+
         task["status"] = "executing"
         task["stage"] = "step5"
         task["message"] = "正在继续生成未完成页面..." if resume else "正在生成PPT..."
@@ -1939,6 +1970,7 @@ async def _run_execute(task_id: str, payload: Optional[ConfirmPayload] = None, r
                 enable_thinking=enable_thinking,
                 progress=on_progress,
                 resume=resume,
+                fmt=fmt_hint,
             )
         )
 

@@ -76,13 +76,13 @@ class FakeEngine:
             for i in range(target_pages)
         ]
 
-    def confirm_and_regenerate(self, project_path_str, user_modifications, enable_thinking=False, progress=None):
+    def confirm_and_regenerate(self, project_path_str, user_modifications, enable_thinking=False, progress=None, fmt=None):
         pages = [{"page_num": 1, "title": "重生成", "filename": "regen.svg",
                   "layout_hint": "cover", "key_points": "x"}]
-        return {"spec_lock": "# spec regen", "page_plan": pages}
+        return {"spec_lock": "# spec regen", "page_plan": pages, "format": fmt or "ppt169"}
 
     def execute(self, project_path_str, spec_lock, page_plan=None, enable_thinking=False,
-                progress=None, resume=False):
+                progress=None, resume=False, fmt=None):
         project = Path(project_path_str)
         pages = page_plan or []
         FakeEngine.last_resume = resume

@@ -17,7 +17,7 @@ def engine(tmp_path, monkeypatch):
     eng = PPTEngine(LLMConfig(api_key="test"))
     calls = []
 
-    def fake_generate(spec_lock, page_info, index, total, source_text, enable_thinking=False):
+    def fake_generate(spec_lock, page_info, index, total, source_text, fmt=None, enable_thinking=False):
         calls.append(page_info.get("filename"))
         return '<svg xmlns="http://www.w3.org/2000/svg">' + ("z" * 300) + "</svg>"
 

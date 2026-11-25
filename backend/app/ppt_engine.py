@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import subprocess
 import sys
@@ -30,6 +31,73 @@ logger = logging.getLogger(__name__)
 SKILL_DIR = Path(__file__).resolve().parents[2] / "skills" / "ppt-master"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 PROJECTS_DIR = Path(__file__).resolve().parents[2] / "projects"
+
+# 画布尺寸以 skills/ppt-master/scripts/config.py 的 CANVAS_FORMATS 为准。
+# 4:3 必须是 1024×768（与项目初始化、质量检查、PPTX 导出保持一致），
+# 不能用 960×720，否则导出的 viewBox 无法识别为 ppt43。
+CANVAS_SIZES: dict[str, tuple[int, int]] = {
+    "ppt169": (1280, 720),
+    "ppt43": (1024, 768),
+    "xiaohongshu": (1242, 1660),
+    "moments": (1080, 1080),
+    "story": (1080, 1920),
+}
+
+_CANVAS_ALIASES = {
+    "ppt16:9": "ppt169",
+    "16:9": "ppt169",
+    "ppt4:3": "ppt43",
+    "4:3": "ppt43",
+    "xhs": "xiaohongshu",
+    "小红书": "xiaohongshu",
+    "3:4": "xiaohongshu",
+}
+
+
+def _ratio_label(width: int, height: int) -> str:
+    g = math.gcd(width, height) or 1
+    return f"{width // g}:{height // g}"
+
+
+def _canvas_info(fmt: str) -> tuple[int, int, str, str]:
+    """返回 (宽, 高, 显示名, 比例)，未知格式回退到 16:9。"""
+    fmt = fmt if fmt in CANVAS_SIZES else "ppt169"
+    width, height = CANVAS_SIZES[fmt]
+    labels = {
+        "ppt169": "PPT 16:9",
+        "ppt43": "PPT 4:3",
+        "xiaohongshu": "小红书 3:4",
+        "moments": "朋友圈 1:1",
+        "story": "Story 9:16",
+    }
+    name = labels.get(fmt, fmt)
+    return width, height, name, _ratio_label(width, height)
+
+
+def _canvas_label(fmt: str) -> str:
+    """用于 Eight Confirmations 的正规画布字符串，例如 'PPT 4:3 (1024×768)'。"""
+    width, height, name, _ = _canvas_info(fmt)
+    if fmt == "xiaohongshu":
+        name = "XHS 3:4"
+    return f"{name} ({width}×{height})"
+
+
+def _fmt_from_text(text: Optional[str]) -> Optional[str]:
+    """从任意文本（spec_lock/design_spec/画布选项）推断画布格式。
+
+    弱模型经常只写 "PPT 4:3 (1024×768)" 而不会写内部代号 "ppt43"，
+    因此这里同时识别比例和尺寸，避免回退成 16:9。
+    """
+    if not text:
+        return None
+    t = str(text).lower()
+    if "ppt43" in t or "4:3" in t or "4 : 3" in t or "1024×768" in t or "1024x768" in t or "0 0 1024 768" in t:
+        return "ppt43"
+    if "xiaohongshu" in t or "3:4" in t or "xhs" in t or "1242×1660" in t or "1242x1660" in t:
+        return "xiaohongshu"
+    if "ppt169" in t or "16:9" in t or "1280×720" in t or "1280x720" in t or "0 0 1280 720" in t:
+        return "ppt169"
+    return None
 
 
 def _run_script(args: list[str], cwd: Optional[str] = None, timeout: int = 120) -> str:
@@ -61,6 +129,242 @@ class PPTEngine:
         self._executor_general = (SKILL_DIR / "references" / "executor-general.md").read_text(encoding="utf-8")
 
     # ══════════════════════════════════════════════════════════
+    #  画布格式解析与强制校正
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _fmt_from_project_path(project_path: Optional[str]) -> Optional[str]:
+        """从项目目录名 / README 读取项目创建时选定的画布格式。"""
+        if not project_path:
+            return None
+        p = Path(project_path)
+        m = re.search(
+            r"(?:^|_)(ppt169|ppt43|xiaohongshu|moments|story)(?:_|$)",
+            p.name.lower(),
+        )
+        if m:
+            return m.group(1)
+        readme = p / "README.md"
+        if readme.exists():
+            try:
+                return _fmt_from_text(readme.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                return None
+        return None
+
+    @staticmethod
+    def resolve_canvas_format(
+        fmt: Optional[str] = None,
+        *,
+        project_path: Optional[str] = None,
+        spec_lock: str = "",
+        design_spec: str = "",
+    ) -> str:
+        """解析画布格式，优先级: 显式参数 > 项目目录/README > spec_lock/design_spec > ppt169。
+
+        用户最初选择的 4:3 会体现为项目目录名中的 `_ppt43_` 或 README 的
+        `Canvas format: ppt43`，因此即使 spec_lock 被模型写成 16:9 也能纠正。
+        """
+        explicit = (fmt or "").strip()
+        if explicit:
+            if explicit in CANVAS_SIZES:
+                return explicit
+            aliased = _CANVAS_ALIASES.get(explicit.lower())
+            if aliased:
+                return aliased
+            from_text = _fmt_from_text(explicit)
+            if from_text:
+                return from_text
+
+        from_project = PPTEngine._fmt_from_project_path(project_path)
+        if from_project:
+            return from_project
+
+        for text in (spec_lock, design_spec):
+            hinted = _fmt_from_text(text)
+            if hinted:
+                return hinted
+        return "ppt169"
+
+    @staticmethod
+    def _force_canvas_in_markdown(md: str, fmt: str) -> str:
+        """把 spec_lock / design_spec 中写错的画布尺寸纠正为目标画布。
+
+        弱模型会把模板里的 1280×720 原样抄下来，即使提示词要求 4:3。
+        这里在写入项目前统一纠正，避免执行阶段拿到自相矛盾的画布定义。
+        """
+        if not md:
+            return md
+        width, height, name, _ = _canvas_info(fmt)
+
+        def _fix_canvas_block(match: re.Match) -> str:
+            block = match.group(0)
+            block = re.sub(
+                r"(?im)^(\s*[-*]?\s*viewBox\s*[:：]\s*)`?[^`\n]*`?",
+                lambda m: f"{m.group(1)}0 0 {width} {height}",
+                block,
+            )
+            block = re.sub(
+                r"(?im)^(\s*[-*]?\s*format\s*[:：]\s*).*$",
+                lambda m: f"{m.group(1)}{name}",
+                block,
+            )
+            return block
+
+        md = re.sub(r"(?ims)^##[ \t]*canvas\b.*?(?=^##[ \t]|\Z)", _fix_canvas_block, md)
+
+        # design_spec 的 Canvas Specification 表格
+        table_rows = {
+            "Canvas Format": f"{name} ({width}×{height})",
+            "Format": name,
+            "Dimensions": f"{width}×{height}",
+            "viewBox": f"`0 0 {width} {height}`",
+        }
+        for label, value in table_rows.items():
+            md = re.sub(
+                rf"(?m)^\|\s*\*\*{re.escape(label)}\*\*\s*\|.*$",
+                f"| **{label}** | {value} |",
+                md,
+            )
+
+        # 其它位置残留的画布尺寸（例如 design_spec 的封面背景尺寸）
+        md = re.sub(r"0\s+0\s+(?:1280|1024|960)\s+720", f"0 0 {width} {height}", md)
+        md = re.sub(
+            r"(?<![\d.])(?:1280|1024|960)\s*[×x]\s*720(?![\d.])",
+            f"{width}×{height}",
+            md,
+        )
+        return md
+
+    @staticmethod
+    def _svg_root_viewbox(svg: str) -> Optional[tuple[float, float, float, float]]:
+        m = re.search(
+            r"<svg\b[^>]*?\bviewBox\s*=\s*[\"']([^\"']+)[\"']",
+            svg[:5000],
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        parts = re.split(r"[\s,]+", m.group(1).strip())
+        if len(parts) != 4:
+            return None
+        try:
+            return tuple(float(p) for p in parts)  # type: ignore[return-value]
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _svg_rect_sizes(svg: str) -> list[tuple[float, float]]:
+        sizes: list[tuple[float, float]] = []
+        for i, m in enumerate(re.finditer(r"<rect\b([^>]*)>", svg, re.IGNORECASE)):
+            if i >= 300:
+                break
+            attrs = m.group(1)
+            wm = re.search(r"\bwidth\s*=\s*[\"']?\s*([\d.]+)", attrs, re.IGNORECASE)
+            hm = re.search(r"\bheight\s*=\s*[\"']?\s*([\d.]+)", attrs, re.IGNORECASE)
+            if not wm or not hm:
+                continue
+            try:
+                sizes.append((float(wm.group(1)), float(hm.group(1))))
+            except ValueError:
+                continue
+        return sizes
+
+    @staticmethod
+    def _set_svg_root_canvas(open_tag: str, width: int, height: int) -> str:
+        """在根 <svg ...> 标签上写入正确的 viewBox / width / height。"""
+        attrs = open_tag[4:-1] if open_tag.lower().startswith("<svg") else open_tag
+        for name, value in (("viewBox", f"0 0 {width} {height}"), ("width", str(width)), ("height", str(height))):
+            pattern = rf"\b{name}\s*=\s*(\"[^\"]*\"|'[^']*')"
+            if re.search(pattern, attrs, re.IGNORECASE):
+                attrs = re.sub(pattern, f'{name}="{value}"', attrs, count=1, flags=re.IGNORECASE)
+            else:
+                attrs = f'{attrs.rstrip()} {name}="{value}"'
+        return f"<svg{attrs}>"
+
+    def _enforce_canvas(
+        self,
+        svg: str,
+        width: int,
+        height: int,
+        bg_color: str = "#FFFFFF",
+        page_no: int = 0,
+        add_if_missing: bool = True,
+    ) -> str:
+        """保证每页 SVG 的根 viewBox 等于目标画布。
+
+        模型常见两种错误：
+        1) 坐标按目标尺寸画，但 viewBox 照抄模板写成 1280×720 → 直接纠正 viewBox；
+        2) 整页按 16:9 设计 → 等比缩放并居中到目标画布，避免裁切。
+        """
+        m = re.search(r"<svg\b[^>]*>", svg, re.IGNORECASE)
+        if not m:
+            return svg
+
+        vb = self._svg_root_viewbox(svg)
+        if vb is None:
+            if add_if_missing:
+                logger.warning("第 %d 页 SVG 缺少 viewBox，已补为 %d×%d", page_no, width, height)
+                return svg[: m.start()] + self._set_svg_root_canvas(m.group(0), width, height) + svg[m.end():]
+            return svg
+
+        vx, vy, vw, vh = vb
+        if abs(vx) < 0.5 and abs(vy) < 0.5 and abs(vw - width) < 0.5 and abs(vh - height) < 0.5:
+            open_tag = m.group(0)
+            attrs = open_tag[4:-1]
+
+            def _attr_state(name: str, expected: str) -> str:
+                """返回 'ok' / 'missing' / 'wrong'"""
+                am = re.search(rf'\b{name}\s*=\s*["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+                if not am:
+                    return "missing"
+                return "ok" if am.group(1).strip().rstrip("px") == expected else "wrong"
+
+            w_state = _attr_state("width", str(width))
+            h_state = _attr_state("height", str(height))
+            if w_state == "ok" and h_state == "ok":
+                return svg  # 已经是目标画布，原样保留（避免改动用户编辑过的页面）
+            if not add_if_missing and w_state == "missing" and h_state == "missing":
+                return svg  # 续跑/用户编辑页：只有 viewBox 正确就不再补属性
+            fixed = self._set_svg_root_canvas(open_tag, width, height)
+            return svg[: m.start()] + fixed + svg[m.end():]
+
+        # 内容本身是否已经按目标画布绘制（例如有铺满 1024×768 的背景）
+        has_target_rect = any(
+            abs(rw - width) < 1 and abs(rh - height) < 1 for rw, rh in self._svg_rect_sizes(svg)
+        )
+        if has_target_rect:
+            logger.warning(
+                "第 %d 页 viewBox=%s 与画布 %d×%d 不一致，但内容按目标尺寸绘制，仅纠正 viewBox",
+                page_no, " ".join(str(int(v)) for v in vb), width, height,
+            )
+            return svg[: m.start()] + self._set_svg_root_canvas(m.group(0), width, height) + svg[m.end():]
+
+        if vw <= 0 or vh <= 0:
+            return svg[: m.start()] + self._set_svg_root_canvas(m.group(0), width, height) + svg[m.end():]
+
+        end = svg.rfind("</svg>")
+        if end < m.end():
+            return svg[: m.start()] + self._set_svg_root_canvas(m.group(0), width, height) + svg[m.end():]
+
+        scale = min(width / vw, height / vh)
+        tx = (width - vw * scale) / 2 - vx * scale
+        ty = (height - vh * scale) / 2 - vy * scale
+        inner = svg[m.end():end]
+        bg_rect = f'<rect x="0" y="0" width="{width}" height="{height}" fill="{bg_color or "#FFFFFF"}"/>'
+        wrapped = (
+            bg_rect
+            + f'\n<g transform="translate({tx:.4f} {ty:.4f}) scale({scale:.6f})">'
+            + inner
+            + "</g>\n"
+        )
+        logger.warning(
+            "第 %d 页 viewBox=%s（比例与画布 %d×%d 不符），已等比缩放居中",
+            page_no, " ".join(str(int(v)) for v in vb), width, height,
+        )
+        return svg[: m.start()] + self._set_svg_root_canvas(m.group(0), width, height) + "\n" + wrapped + svg[end:]
+
+    # ══════════════════════════════════════════════════════════
     #  公开 API
     # ══════════════════════════════════════════════════════════
 
@@ -90,6 +394,13 @@ class PPTEngine:
             }
         """
         _prog = _make_progress(progress)
+
+        # 画布格式以项目创建时的选择为准（续跑时不能因为调用方默认值变回 16:9）
+        if resume_project_path and Path(resume_project_path).is_dir():
+            fmt = self._fmt_from_project_path(resume_project_path) or self.resolve_canvas_format(fmt)
+        else:
+            fmt = self.resolve_canvas_format(fmt)
+        canvas_w, canvas_h, canvas_name, canvas_ratio = _canvas_info(fmt)
 
         # ── Step 1: 源内容已就绪(由上层处理) ──
         _prog("step1", "Step 1: 源内容已就绪", 5)
@@ -142,6 +453,17 @@ class PPTEngine:
             source_text, topic, fmt, enable_thinking=enable_thinking
         )
 
+        # 纠正模型照抄模板写错的画布（例如用户选 4:3 却输出 1280×720）
+        spec_lock = self._force_canvas_in_markdown(spec_lock, fmt)
+        design_spec = self._force_canvas_in_markdown(design_spec, fmt)
+        expected_canvas = _canvas_label(fmt)
+        if eight_confirmations.get("canvas_format") != expected_canvas:
+            logger.warning(
+                "Strategist 返回的画布格式 %r 与用户选择 %r 不一致，已纠正",
+                eight_confirmations.get("canvas_format"), expected_canvas,
+            )
+            eight_confirmations["canvas_format"] = expected_canvas
+
         # 持久化到项目目录
         (project_path / "design_spec.md").write_text(design_spec, encoding="utf-8")
         (project_path / "spec_lock.md").write_text(spec_lock, encoding="utf-8")
@@ -187,6 +509,7 @@ class PPTEngine:
             "page_plan": pages,
             "source_text": source_text,
             "topic": topic,
+            "format": fmt,
         }
 
     def confirm_and_regenerate(
@@ -195,12 +518,14 @@ class PPTEngine:
         user_modifications: dict,
         enable_thinking: bool = False,
         progress: Optional[Callable] = None,
+        fmt: Optional[str] = None,
     ) -> dict:
         """Step 4 续: 用户修改了 Eight Confirmations, 重新生成 spec_lock
 
         Args:
             project_path_str: 项目路径
             user_modifications: 用户修改后的 Eight Confirmations JSON
+            fmt: 用户确认的画布格式（未传时从项目目录推断）
         """
         _prog = _make_progress(progress)
         project_path = Path(project_path_str)
@@ -209,11 +534,23 @@ class PPTEngine:
 
         source_text = (project_path / "sources" / "source.md").read_text(encoding="utf-8")
         topic = project_path.name.split("_")[0]
-        fmt = "ppt169"
+        old_spec_lock = ""
+        old_spec_file = project_path / "spec_lock.md"
+        if old_spec_file.exists():
+            old_spec_lock = old_spec_file.read_text(encoding="utf-8", errors="replace")
+
+        # 用户可能直接在确认页修改了画布格式，优先使用该值
+        canvas_hint = user_modifications.get("canvas_format") if isinstance(user_modifications, dict) else None
+        fmt = self.resolve_canvas_format(
+            canvas_hint or fmt,
+            project_path=str(project_path),
+            spec_lock=old_spec_lock,
+        )
 
         spec_lock = self._regenerate_spec_lock(
             source_text, topic, fmt, user_modifications, enable_thinking=enable_thinking
         )
+        spec_lock = self._force_canvas_in_markdown(spec_lock, fmt)
 
         (project_path / "spec_lock.md").write_text(spec_lock, encoding="utf-8")
         pages = self._parse_page_plan(spec_lock)
@@ -222,6 +559,7 @@ class PPTEngine:
         return {
             "spec_lock": spec_lock,
             "page_plan": pages,
+            "format": fmt,
         }
 
     def execute(
@@ -232,6 +570,7 @@ class PPTEngine:
         enable_thinking: bool = False,
         progress: Optional[Callable] = None,
         resume: bool = False,
+        fmt: Optional[str] = None,
     ) -> Path:
         """Steps 5-7: Executor SVG生成 + 后处理 + 导出
 
@@ -240,11 +579,26 @@ class PPTEngine:
             spec_lock: spec_lock.md 内容(可能经过用户修改后重新生成)
             page_plan: 用户确认的页面规划（优先于spec_lock中解析）
             resume: 续跑模式，跳过 svg_output 中已生成完整的页面
+            fmt: 画布格式（ppt169/ppt43/...），未传时从项目目录/spec_lock 推断
         Returns:
             生成的 .pptx 文件路径
         """
         _prog = _make_progress(progress)
         project_path = Path(project_path_str)
+
+        # 确定画布：显式参数 > 项目目录名/README > spec_lock > 默认 16:9
+        fmt = self.resolve_canvas_format(fmt, project_path=str(project_path), spec_lock=spec_lock)
+        canvas_w, canvas_h, canvas_name, canvas_ratio = _canvas_info(fmt)
+        normalized_spec = self._force_canvas_in_markdown(spec_lock, fmt)
+        if normalized_spec != spec_lock:
+            logger.warning(
+                "spec_lock 画布定义与项目画布不一致，已纠正为 %s %d×%d",
+                canvas_name, canvas_w, canvas_h,
+            )
+            spec_lock = normalized_spec
+            (project_path / "spec_lock.md").write_text(spec_lock, encoding="utf-8")
+        logger.info("执行画布: %s %d×%d (%s)", canvas_name, canvas_w, canvas_h, canvas_ratio)
+        bg_color = self._extract_bg_color(spec_lock)
 
         # ── Step 5: 图片获取(离线环境跳过) ──
         _prog("step5", "Step 5: 离线环境, 跳过图片获取", 27)
@@ -308,6 +662,14 @@ class PPTEngine:
                 try:
                     existing = target.read_text(encoding="utf-8", errors="replace")
                     if len(existing) >= 200 and "</svg>" in existing[-4096:].lower():
+                        # 旧版本可能把 4:3 项目生成为 16:9，续跑时顺手纠正画布
+                        fixed = self._enforce_canvas(
+                            existing, canvas_w, canvas_h, bg_color,
+                            page_no=i + 1, add_if_missing=False,
+                        )
+                        if fixed != existing:
+                            target.write_text(fixed, encoding="utf-8")
+                            logger.info("续跑: 已纠正第 %d 页画布为 %d×%d", i + 1, canvas_w, canvas_h)
                         skipped_pages += 1
                         logger.info("续跑: 已保留第 %d/%d 页 %s", i + 1, total_pages, fname)
                         _prog("step6", f"续跑: 已保留第 {i+1}/{total_pages} 页", pct)
@@ -318,27 +680,36 @@ class PPTEngine:
 
             _prog("step6", f"正在生成第 {i+1}/{total_pages} 页: {page_info.get('title', '')}", pct)
             svg_content = self._generate_svg_page(
-                spec_lock, page_info, i, total_pages, source_text, enable_thinking=enable_thinking
+                spec_lock, page_info, i, total_pages, source_text,
+                fmt=fmt, enable_thinking=enable_thinking,
             )
             # 移除SVG动画元素（svg_to_pptx不支持 animate/animateTransform/animateMotion）
             svg_content = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*/>", "", svg_content, flags=re.DOTALL)
             svg_content = re.sub(r"<animate(?:Transform|Motion)?\b[^>]*>.*?</animate(?:Transform|Motion)?>", "", svg_content, flags=re.DOTALL)
 
-            # 兜底：如果SVG缺少背景rect，自动补一个铺满viewBox的背景
-            if not re.search(r'<rect\b[^>]*\bwidth\s*=\s*["\']?1280["\']?', svg_content) and \
-               not re.search(r'<rect\b[^>]*\bwidth\s*=\s*["\']?960["\']?', svg_content):
-                svg_fmt = "ppt43" if "ppt43" in spec_lock else "ppt169"
-                _W, _H = ("960", "720") if svg_fmt == "ppt43" else ("1280", "720")
-                bg_color = self._extract_bg_color(spec_lock)
-                bg_rect = f'<rect x="0" y="0" width="{_W}" height="{_H}" fill="{bg_color}"/>'
-                # 插入到顶层 <g> 标签后
-                g_match = re.search(r'(<g\b[^>]*>)', svg_content)
-                if g_match:
-                    svg_content = svg_content[:g_match.end()] + "\n  " + bg_rect + svg_content[g_match.end():]
-                    logger.info("已为第 %d 页自动补充背景: %s", i+1, bg_color)
-
             # ── SVG 修复 (弱模型常见错误) ──
             svg_content = self._fix_svg(svg_content)
+
+            # ── 画布兜底：强制 viewBox 与项目画布一致 ──
+            svg_content = self._enforce_canvas(
+                svg_content, canvas_w, canvas_h, bg_color, page_no=i + 1
+            )
+
+            # 兜底：如果SVG缺少铺满目标画布的背景rect，自动补一个（插在根元素后，保证在最底层）
+            has_fullbleed_bg = any(
+                abs(rw - canvas_w) < 1 and abs(rh - canvas_h) < 1
+                for rw, rh in self._svg_rect_sizes(svg_content)
+            )
+            if not has_fullbleed_bg:
+                bg_rect = f'<rect x="0" y="0" width="{canvas_w}" height="{canvas_h}" fill="{bg_color}"/>'
+                root_match = re.search(r"<svg\b[^>]*>", svg_content, re.IGNORECASE)
+                if root_match:
+                    svg_content = (
+                        svg_content[:root_match.end()]
+                        + "\n  " + bg_rect
+                        + svg_content[root_match.end():]
+                    )
+                    logger.info("已为第 %d 页自动补充 %d×%d 背景: %s", i + 1, canvas_w, canvas_h, bg_color)
 
             # ── XML 校验 ──
             # _fix_svg 已经做了预处理, 这里做最终验证
@@ -475,6 +846,7 @@ class PPTEngine:
             preview_result.get("page_plan"),
             enable_thinking,
             progress,
+            fmt=preview_result.get("format", fmt),
         )
 
     # ══════════════════════════════════════════════════════════
@@ -500,15 +872,20 @@ class PPTEngine:
 
         truncated = source_text[:15000] + ("\n...(内容已截断)" if len(source_text) > 15000 else "")
 
+        fmt = self.resolve_canvas_format(fmt)
+        canvas_w, canvas_h, canvas_name, canvas_ratio = _canvas_info(fmt)
+        canvas_label = _canvas_label(fmt)
+
         user_msg = (
             f"请为以下内容生成PPT设计方案。\n\n"
-            f"## 主题: {topic}\n## 格式: {fmt}\n\n"
+            f"## 主题: {topic}\n"
+            f"## 画布: {canvas_label}，viewBox 必须是 `0 0 {canvas_w} {canvas_h}`（比例 {canvas_ratio}）\n\n"
             f"## 源内容\n{truncated}\n\n"
             "请严格按照以下格式输出，分三部分:\n\n"
             "===EIGHT_CONFIRMATIONS===\n"
             "输出JSON格式的八项确认(严格遵守):\n"
             "{\n"
-            '  "canvas_format": "PPT 16:9 (1280×720)",\n'
+            f'  "canvas_format": "{canvas_label}",\n'
             '  "page_count": {"min": 5, "max": 15, "recommended": 8},\n'
             '  "target_audience": "目标受众描述",\n'
             '  "style_objective": "风格目标描述",\n'
@@ -530,7 +907,9 @@ class PPTEngine:
             "===SPEC_LOCK===\n"
             "完整的 spec_lock.md (机器可读的执行锁定文件)\n\n"
             "要求:\n"
-            f"- 画布格式: {fmt}\n"
+            f"- 画布格式(不可更改): {canvas_name} {canvas_w}×{canvas_h}（{canvas_ratio}）\n"
+            f"- spec_lock 的 canvas 节必须写: viewBox: 0 0 {canvas_w} {canvas_h} / format: {canvas_name}\n"
+            f"- design_spec 的画布尺寸必须写 {canvas_w}×{canvas_h}，禁止使用 1280×720 或 16:9\n"
             "- 页数规则(严格遵守):\n"
             "  · 先统计源内容的自然段落数/章节数/列表项数，每个有实质内容的段落/章节至少独立成页\n"
             "  · 最少5页(1封面+3内容+1结束)，最多25页\n"
@@ -571,11 +950,16 @@ class PPTEngine:
 
         truncated = source_text[:15000] + ("\n...(内容已截断)" if len(source_text) > 15000 else "")
 
+        canvas_w, canvas_h, canvas_name, canvas_ratio = _canvas_info(fmt)
         user_msg = (
-            f"## 主题: {topic}\n## 格式: {fmt}\n\n"
+            f"## 主题: {topic}\n"
+            f"## 画布(不可更改): {canvas_name} {canvas_w}×{canvas_h}（{canvas_ratio}），"
+            f"viewBox 必须是 0 0 {canvas_w} {canvas_h}\n\n"
             f"## 源内容\n{truncated}\n\n"
             f"## 用户确认的设计方案\n{json.dumps(user_modifications, ensure_ascii=False, indent=2)}\n\n"
             "请输出完整的 spec_lock.md，严格遵循用户确认的配色、字体、页数等方案。\n"
+            f"- canvas 节必须写: viewBox: 0 0 {canvas_w} {canvas_h} / format: {canvas_name}\n"
+            f"- 禁止把画布写成 16:9 或 1280×720（本项目是 {canvas_ratio}）\n"
             "- page_plan 每页必须有: page_num, title, filename, layout_hint, key_points\n"
             "- 只输出 spec_lock 内容，不要其他解释\n"
         )
@@ -1074,11 +1458,20 @@ class PPTEngine:
         return accumulated
 
     def _generate_svg_page(
-        self, spec_lock: str, page_info: dict, page_idx: int, total: int, source_text: str = "", *, enable_thinking: bool = False
+        self,
+        spec_lock: str,
+        page_info: dict,
+        page_idx: int,
+        total: int,
+        source_text: str = "",
+        *,
+        fmt: Optional[str] = None,
+        enable_thinking: bool = False,
     ) -> str:
         """调用 LLM 为单页生成 SVG"""
-        fmt = "ppt43" if "ppt43" in spec_lock else "ppt169"
-        W, H = ("960", "720") if fmt == "ppt43" else ("1280", "720")
+        fmt = self.resolve_canvas_format(fmt, spec_lock=spec_lock)
+        canvas_w, canvas_h, canvas_name, canvas_ratio = _canvas_info(fmt)
+        W, H = str(canvas_w), str(canvas_h)
 
         system = (
             "你是PPT执行者(Executor)，负责生成单个SVG页面。\n\n"
@@ -1106,6 +1499,11 @@ class PPTEngine:
 
         user_msg = (
             f"请为以下页面生成完整的SVG代码。\n\n"
+            f"## 画布(最高优先级，覆盖 spec_lock 中的任何冲突)\n"
+            f"- 格式: {canvas_name}，比例 {canvas_ratio}\n"
+            f"- viewBox: `0 0 {W} {H}`，根 <svg> 的 width={W} height={H}\n"
+            f"- 所有坐标必须落在 0~{W}(宽) / 0~{H}(高) 范围内\n"
+            f"- 禁止使用 16:9 或 1280×720 的画布（除非本项目就是 16:9）\n\n"
             f"## 当前项目 spec_lock\n{spec_lock[:8000]}\n\n"
             f"## 当前页信息\n"
             f"- 页码: {page_info.get('page_num', page_idx+1)}/{total}\n"
@@ -1121,7 +1519,7 @@ class PPTEngine:
             )
         user_msg += (
             f"## 要求\n"
-            f"- SVG viewBox='0 0 {W} {H}', xmlns='http://www.w3.org/2000/svg'\n"
+            f"- SVG 根元素必须是: <svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}'>\n"
             f"- 使用spec_lock中定义的颜色、字体\n"
             f"- 必须有 id='page_{page_info.get('page_num', page_idx+1)}' 的顶层 <g> 元素\n"
             f"- **必须包含背景**: 第一个子元素必须是铺满整个viewBox的<rect>(x=0 y=0 width={W} height={H}), 使用spec_lock中的背景色或渐变\n"
